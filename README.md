@@ -23,7 +23,7 @@ dsh plugin --profile web add github:j2st1n/dsh-opencode-status
 
 > **说明**：
 > - 无需指定版本号，默认直接拉取 GitHub 上的**最新版本**（相当于 `@latest`）；
-> - 若需锁定特定稳定版本，可指定 Tag：`dsh plugin --profile web add github:j2st1n/dsh-opencode-status#v0.1.1`；
+> - 若需锁定特定稳定版本，可指定 Tag：`dsh plugin --profile web add github:j2st1n/dsh-opencode-status#v0.1.2`；
 > - 安装后重启 `dsh web` 即可立即生效。
 
 ### 2. 卸载

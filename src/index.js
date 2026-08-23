@@ -20,8 +20,11 @@ const DEFAULT_BASE_URL = 'https://opencode.ai/zen/go'
 const DEFAULT_CACHE_TTL_MS = 30_000
 const REQUEST_TIMEOUT_MS = 10_000
 
+const envBaseUrl = normalizeBase(process.env.OPENCODE_BASE_URL)
+
 const schema = z.object({
-  baseUrl: z.string().default(DEFAULT_BASE_URL),
+  // 环境变量只作为未持久化配置时的默认值；非法值不覆盖官方端点。
+  baseUrl: z.string().default(isAbsoluteHttpUrl(envBaseUrl) ? envBaseUrl : DEFAULT_BASE_URL),
   keyRef: z.string().default(DEFAULT_KEY_REF),
 })
 
@@ -58,11 +61,6 @@ async function fetchUsageFromGateway(baseUrl, apiKey) {
 
 export function apply(ctx) {
   const scope = ctx.settings.register(NS, schema)
-
-  // 环境变量首填
-  if (!normalizeBase(scope.get().baseUrl) && process.env.OPENCODE_BASE_URL) {
-    scope.update({ baseUrl: process.env.OPENCODE_BASE_URL }).catch(() => {})
-  }
 
   /** @type {{ at: number, data: any } | null} */
   let usageCache = null
@@ -246,7 +244,7 @@ export function apply(ctx) {
 
         const newKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
         const clearKey = body.clearApiKey === true
-        const keyRef = DEFAULT_KEY_REF
+        const keyRef = scope.get().keyRef || DEFAULT_KEY_REF
 
         if (clearKey && newKey) {
           return sendJson(res, 400, { error: { code: 'INVALID', message: '不能同时设置新密钥并清除密钥' } })
@@ -267,6 +265,18 @@ export function apply(ctx) {
           config: await publicConfig(),
           status: await buildStatus(true),
         })
+      }),
+    }),
+  )
+
+  // 路由 3：显式同步。保留 GET ?force=1 兼容旧客户端，新客户端使用该端点。
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/api/opencode-status/sync',
+      handler: guard(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'POST only' } })
+        sendJson(res, 200, await buildStatus(true))
       }),
     }),
   )
