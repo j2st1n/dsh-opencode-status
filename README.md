@@ -13,14 +13,23 @@ OpenCode GO 套餐用量与配额状态监控面板插件（DeepSeek Harness）�
 - **平滑交互**：悬浮面板智能定位，点击外部空白区域自动收起，用完即走。
 - **多端同步与缓存**：服务端 30s 智能缓存，支持一键手动强制刷新。
 
-## 安装
+## 安装与更新
+
+### 1. 一键安装（自动拉取最新最新版）
 
 ```sh
-# GitHub 直装
 dsh plugin --profile web add github:j2st1n/dsh-opencode-status
+```
 
-# 离线 tarball 安装
-dsh plugin --profile web add ./dsh-opencode-status-0.1.0.tgz
+> **说明**：
+> - 无需指定版本号，默认直接拉取 GitHub 上的**最新版本**（相当于 `@latest`）；
+> - 若需锁定特定稳定版本，可指定 Tag：`dsh plugin --profile web add github:j2st1n/dsh-opencode-status#v0.1.1`；
+> - 安装后重启 `dsh web` 即可立即生效。
+
+### 2. 卸载
+
+```sh
+dsh plugin --profile web remove dsh-opencode-status
 ```
 
 ## 配置
