@@ -1,0 +1,4 @@
+# dsh-opencode-status bundle patch
+- insert:
+    - id: opencode-status
+      name: dsh-opencode-status

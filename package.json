@@ -1,0 +1,48 @@
+{
+  "name": "dsh-opencode-status",
+  "version": "0.1.0",
+  "description": "OpenCode GO quota and plan status panel for DeepSeek Harness: sidebar health light, quota bars, countdown timers, and in-app key management",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "opencode",
+    "opencode-go",
+    "status-panel"
+  ],
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/j2st1n/dsh-opencode-status.git"
+  },
+  "homepage": "https://github.com/j2st1n/dsh-opencode-status#readme",
+  "bugs": "https://github.com/j2st1n/dsh-opencode-status/issues",
+  "engines": {
+    "node": ">=20"
+  }
+}
