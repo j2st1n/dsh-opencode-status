@@ -15,13 +15,14 @@ window.__ModuleLoader__.load({
     const { useEffect, useState, useRef } = React
 
     const CSS = `
+      div[class*="footerActions"] { display: flex !important; flex-direction: column !important; gap: 4px !important; width: 100% !important; }
       @keyframes ocFadeSlideUp { from { opacity: 0; transform: translateY(8px) scale(.98) } to { opacity: 1; transform: translateY(0) scale(1) } }
       @keyframes ocFadeSlideDown { from { opacity: 1; transform: translateY(0) scale(1) } to { opacity: 0; transform: translateY(8px) scale(.98) } }
       @keyframes ocSpin { to { transform: rotate(360deg) } }
       @keyframes ocPulse { 0% { box-shadow: 0 0 0 0 rgba(34,197,94,.45) } 70% { box-shadow: 0 0 0 5px rgba(34,197,94,0) } 100% { box-shadow: 0 0 0 0 rgba(34,197,94,0) } }
       .oc-panel-enter { animation: ocFadeSlideUp .2s cubic-bezier(.2,.9,.3,1.2) both }
       .oc-panel-exit { animation: ocFadeSlideDown .15s ease-in both; pointer-events: none !important }
-      .oc-btn { transition: background .15s ease, border-color .15s ease, color .15s ease, transform .1s ease }
+      .oc-btn { min-width: 0; transition: background .15s ease, border-color .15s ease, color .15s ease, transform .1s ease }
       .oc-btn:hover:not(:disabled):not(.oc-btn-primary) { background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-1)); border-color: var(--dsw-alias-border-l2) }
       .oc-btn-primary:hover:not(:disabled) { filter: brightness(1.12) }
       .oc-btn:active:not(:disabled) { transform: scale(.98) }
@@ -208,11 +209,13 @@ window.__ModuleLoader__.load({
           className: 'oc-btn oc-footer-btn',
           style: {
             ...btnBase,
-            display: 'flex',
-            width: '100%',
+            display: props?.wide === false ? 'inline-flex' : 'flex',
+            width: props?.wide === false ? undefined : '100%',
             boxSizing: 'border-box',
-            justifyContent: 'flex-start',
+            justifyContent: props?.wide === false ? 'center' : 'flex-start',
             margin: '2px 0',
+            minWidth: 0,
+            flexShrink: 0,
           },
           onClick: () => {
             store.set({ open: !state.open, editing: false })
@@ -226,13 +229,13 @@ window.__ModuleLoader__.load({
         h('span', { className: color === T.ok ? 'oc-dot-live' : undefined, style: dotStyle(color) }),
         h(
           'span',
-          { style: { display: 'inline-flex', alignItems: 'baseline', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' } },
+          { style: { display: 'inline-flex', alignItems: 'baseline', whiteSpace: 'nowrap', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } },
           [
-            h('span', { key: 't', style: { color: T.label } }, text),
+            h('span', { key: 't', style: { color: T.label, flexShrink: 0 } }, text),
             value
               ? [
-                  h('span', { key: 'sep', style: { color: T.secondary, margin: '0 5px', opacity: 0.7 } }, '·'),
-                  h('span', { key: 'v', style: { color, fontWeight: 500 } }, value),
+                  h('span', { key: 'sep', style: { color: T.secondary, margin: '0 5px', opacity: 0.7, flexShrink: 0 } }, '·'),
+                  h('span', { key: 'v', style: { color, fontWeight: 500, fontVariantNumeric: 'tabular-nums', overflow: 'hidden', textOverflow: 'ellipsis' } }, value),
                 ]
               : null,
           ].flat().filter(Boolean),
