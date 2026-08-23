@@ -432,13 +432,26 @@ window.__ModuleLoader__.load({
           // 头部
           h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, borderBottom: `1px solid ${T.border}`, paddingBottom: 8 } }, [
             h('span', { style: { fontSize: 13, fontWeight: 600, color: T.label } }, showConfig ? '配置 OpenCode' : 'OpenCode GO 用量'),
-            h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } }, [
+            h('div', { style: { display: 'flex', gap: 4, alignItems: 'center' } }, [
               !showConfig
                 ? h(
                     'button',
                     {
                       className: 'oc-btn',
-                      style: { ...btnBase, padding: '2px 6px', fontSize: 11, border: 'none' },
+                      style: {
+                        width: 26,
+                        height: 26,
+                        padding: 0,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        fontSize: 14,
+                        border: 'none',
+                        borderRadius: 6,
+                        cursor: 'pointer',
+                        color: T.secondary,
+                        background: 'transparent',
+                      },
                       onClick: async () => {
                         store.set({ refreshing: true })
                         await refreshStatus(true)
@@ -454,7 +467,20 @@ window.__ModuleLoader__.load({
                     'button',
                     {
                       className: 'oc-btn',
-                      style: { ...btnBase, padding: '2px 6px', fontSize: 11, border: 'none' },
+                      style: {
+                        width: 26,
+                        height: 26,
+                        padding: 0,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        fontSize: 15,
+                        border: 'none',
+                        borderRadius: 6,
+                        cursor: 'pointer',
+                        color: T.secondary,
+                        background: 'transparent',
+                      },
                       onClick: () => {
                         store.set({ editing: true })
                         refreshConfig()
@@ -468,7 +494,20 @@ window.__ModuleLoader__.load({
                 'button',
                 {
                   className: 'oc-btn',
-                  style: { ...btnBase, padding: '2px 6px', fontSize: 11, border: 'none' },
+                  style: {
+                    width: 26,
+                    height: 26,
+                    padding: 0,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontSize: 13,
+                    border: 'none',
+                    borderRadius: 6,
+                    cursor: 'pointer',
+                    color: T.secondary,
+                    background: 'transparent',
+                  },
                   onClick: () => store.set({ open: false, editing: false }),
                   title: '关闭',
                 },
