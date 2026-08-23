@@ -48,14 +48,16 @@ window.__ModuleLoader__.load({
 
     const dotStyle = (color) => ({
       display: 'inline-block',
-      width: 8,
-      height: 8,
+      width: 7,
+      height: 7,
       borderRadius: '50%',
       background: color,
       flexShrink: 0,
+      verticalAlign: 'middle',
     })
 
     const btnBase = {
+      display: 'flex',
       alignItems: 'center',
       gap: 6,
       padding: '4px 8px',
@@ -64,6 +66,9 @@ window.__ModuleLoader__.load({
       background: 'transparent',
       color: T.label,
       fontSize: 12,
+      lineHeight: '18px',
+      height: 28,
+      boxSizing: 'border-box',
       cursor: 'pointer',
       whiteSpace: 'nowrap',
     }
@@ -229,7 +234,7 @@ window.__ModuleLoader__.load({
         h('span', { className: color === T.ok ? 'oc-dot-live' : undefined, style: dotStyle(color) }),
         h(
           'span',
-          { style: { display: 'inline-flex', alignItems: 'baseline', whiteSpace: 'nowrap', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } },
+          { style: { display: 'inline-flex', alignItems: 'center', lineHeight: '18px', whiteSpace: 'nowrap', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } },
           [
             h('span', { key: 't', style: { color: T.label, flexShrink: 0 } }, text),
             value
