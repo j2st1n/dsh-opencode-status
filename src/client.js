@@ -153,15 +153,26 @@ window.__ModuleLoader__.load({
       } catch {}
     }
 
-    // ---------- 常驻入口（上下结构单行按钮） ----------
+    // ---------- 常驻入口（上下结构单行按钮 + 悬停微卡） ----------
     function FooterEntry(props) {
       const state = useStore()
+      const [hovering, setHovering] = useState(false)
+      const hoverTimerRef = useRef(null)
 
       useEffect(() => {
         refreshStatus(false)
         const timer = setInterval(() => refreshStatus(false), 30_000)
         return () => clearInterval(timer)
       }, [])
+
+      const onMouseEnter = () => {
+        clearTimeout(hoverTimerRef.current)
+        hoverTimerRef.current = setTimeout(() => setHovering(true), 220)
+      }
+      const onMouseLeave = () => {
+        clearTimeout(hoverTimerRef.current)
+        setHovering(false)
+      }
 
       const st = state.status
       let color = T.warn
@@ -210,10 +221,12 @@ window.__ModuleLoader__.load({
         )
       }
 
-      return h(
+      const node = h(
         'button',
         {
           className: 'oc-btn oc-footer-btn',
+          onMouseEnter,
+          onMouseLeave,
           style: {
             ...btnBase,
             display: props?.wide === false ? 'inline-flex' : 'flex',
@@ -223,6 +236,8 @@ window.__ModuleLoader__.load({
             margin: '2px 0',
             minWidth: 0,
             flexShrink: 0,
+            borderColor: state.open ? T.brand : T.border,
+            background: state.open ? 'var(--dsw-alias-interactive-bg-hover, rgba(59,130,246,.12))' : 'transparent',
           },
           onClick: () => {
             store.set({ open: !state.open, editing: false })
@@ -231,14 +246,13 @@ window.__ModuleLoader__.load({
               refreshConfig()
             }
           },
-          title: st?.error?.message || `OpenCode GO · ${value || '点击查看详情'}`,
         },
         h('span', { className: color === T.ok ? 'oc-dot-live' : undefined, style: dotStyle(color) }),
         h(
           'span',
           { style: { display: 'inline-flex', alignItems: 'center', lineHeight: '18px', whiteSpace: 'nowrap', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } },
           [
-            h('span', { key: 't', style: { color: T.label, flexShrink: 0 } }, text),
+            h('span', { key: 't', style: { color: T.label, fontWeight: 500, flexShrink: 0 } }, text),
             value
               ? [
                   h('span', { key: 'sep', style: { color: T.secondary, margin: '0 5px', opacity: 0.7, flexShrink: 0 } }, '·'),
@@ -246,6 +260,53 @@ window.__ModuleLoader__.load({
                 ]
               : null,
           ].flat().filter(Boolean),
+        ),
+      )
+
+      if (!hovering || state.open || !st?.ok || !st?.windows?.length) return node
+
+      return h(
+        'div',
+        {
+          style: { position: 'relative', width: '100%' },
+          onMouseEnter,
+          onMouseLeave,
+        },
+        node,
+        h(
+          'div',
+          {
+            className: 'oc-panel-enter',
+            style: {
+              position: 'absolute',
+              left: 0,
+              right: 0,
+              bottom: 'calc(100% + 6px)',
+              background: T.bg,
+              border: `1px solid ${T.border2}`,
+              borderRadius: '10px',
+              boxShadow: '0 8px 24px rgba(0,0,0,.18)',
+              padding: '12px 14px 4px 14px',
+              fontSize: '11px',
+              color: T.label,
+              zIndex: 100,
+              fontFamily: 'system-ui, -apple-system, sans-serif',
+            },
+          },
+          h(
+            'div',
+            {
+              style: {
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                marginBottom: 10,
+              },
+            },
+            h('span', { style: { fontWeight: 600, fontSize: '12px' } }, '🚀 OpenCode GO 用量概览'),
+            st.plan ? h('span', { style: { fontSize: '10px', color: T.brand, fontWeight: 600 } }, st.plan) : null,
+          ),
+          st.windows.map((w, i) => h(QuotaRow, { key: i, window: w })),
         ),
       )
     }
