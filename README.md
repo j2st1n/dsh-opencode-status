@@ -15,18 +15,23 @@ OpenCode GO 套餐用量与配额状态监控面板插件（DeepSeek Harness）�
 
 ## 安装与更新
 
-### 1. 一键安装（自动拉取最新最新版）
+### 1. 官方 npm 安装（推荐）
+
+```sh
+dsh plugin --profile web add dsh-opencode-status
+```
+
+### 2. GitHub 仓库直接安装
 
 ```sh
 dsh plugin --profile web add github:j2st1n/dsh-opencode-status
 ```
 
 > **说明**：
-> - 无需指定版本号，默认直接拉取 GitHub 上的**最新版本**（相当于 `@latest`）；
-> - 若需锁定特定稳定版本，可指定 Tag：`dsh plugin --profile web add github:j2st1n/dsh-opencode-status#v0.1.2`；
+> - 无需指定版本号，默认拉取 `@latest` 最新版本；
 > - 安装后重启 `dsh web` 即可立即生效。
 
-### 2. 卸载
+### 3. 卸载
 
 ```sh
 dsh plugin --profile web remove dsh-opencode-status
