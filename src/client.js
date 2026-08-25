@@ -437,7 +437,7 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    // ---------- 浮层面板 ----------
+    // ---------- 浮层配置面板（点击进入控制台管理，用量已在悬浮卡片展示） ----------
     function OverlayPanel() {
       const state = useStore()
       const panelRef = useRef(null)
@@ -470,7 +470,6 @@ window.__ModuleLoader__.load({
       if (phase === 'closed') return null
 
       const st = state.status
-      const showConfig = state.editing || !st || st.mode === 'needs_config'
 
       return h(
         'div',
@@ -494,65 +493,35 @@ window.__ModuleLoader__.load({
         [
           // 头部
           h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, borderBottom: `1px solid ${T.border}`, paddingBottom: 8 } }, [
-            h('span', { style: { fontSize: 13, fontWeight: 600, color: T.label } }, showConfig ? '配置 OpenCode' : 'OpenCode GO 用量'),
+            h('span', { style: { fontSize: 13, fontWeight: 600, color: T.label } }, '⚙ OpenCode GO 连接配置'),
             h('div', { style: { display: 'flex', gap: 4, alignItems: 'center' } }, [
-              !showConfig
-                ? h(
-                    'button',
-                    {
-                      className: 'oc-btn',
-                      style: {
-                        width: 26,
-                        height: 26,
-                        padding: 0,
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        fontSize: 14,
-                        border: 'none',
-                        borderRadius: 6,
-                        cursor: 'pointer',
-                        color: T.secondary,
-                        background: 'transparent',
-                      },
-                      onClick: async () => {
-                        store.set({ refreshing: true })
-                        await refreshStatus(true)
-                        store.set({ refreshing: false })
-                      },
-                      title: '刷新用量',
-                    },
-                    state.refreshing ? h('span', { className: 'oc-spin' }, '↻') : '↻',
-                  )
-                : null,
-              !showConfig
-                ? h(
-                    'button',
-                    {
-                      className: 'oc-btn',
-                      style: {
-                        width: 26,
-                        height: 26,
-                        padding: 0,
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        fontSize: 15,
-                        border: 'none',
-                        borderRadius: 6,
-                        cursor: 'pointer',
-                        color: T.secondary,
-                        background: 'transparent',
-                      },
-                      onClick: () => {
-                        store.set({ editing: true })
-                        refreshConfig()
-                      },
-                      title: '更新配置',
-                    },
-                    '⚙',
-                  )
-                : null,
+              h(
+                'button',
+                {
+                  className: 'oc-btn',
+                  style: {
+                    width: 26,
+                    height: 26,
+                    padding: 0,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontSize: 14,
+                    border: 'none',
+                    borderRadius: 6,
+                    cursor: 'pointer',
+                    color: T.secondary,
+                    background: 'transparent',
+                  },
+                  onClick: async () => {
+                    store.set({ refreshing: true })
+                    await refreshStatus(true)
+                    store.set({ refreshing: false })
+                  },
+                  title: '强制刷新同步',
+                },
+                state.refreshing ? h('span', { className: 'oc-spin' }, '↻') : '↻',
+              ),
               h(
                 'button',
                 {
@@ -578,14 +547,8 @@ window.__ModuleLoader__.load({
               ),
             ]),
           ]),
-          // 内容
-          showConfig
-            ? h(ConfigCard)
-            : h('div', null, [
-                st?.error ? h('div', { key: 'err', style: { fontSize: 11, color: T.err, marginBottom: 8 } }, st.error.message) : null,
-                ...(st?.windows ?? []).map((w) => h(QuotaRow, { key: w.id, window: w })),
-                h('div', { key: 'tip', style: { fontSize: 10, color: T.secondary, textAlign: 'right', marginTop: 6 } }, `更新于 ${new Date(st?.fetchedAt || Date.now()).toLocaleTimeString()}`),
-              ]),
+          // 内容：直接展示配置与连接管理
+          h(ConfigCard),
         ],
       )
     }
