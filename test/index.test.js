@@ -633,14 +633,22 @@ test('热改 baseUrl / keyRef 后缓存立即失效，下一次 GET 重新拉取
   }
 })
 
-test('package.json 声明 DSH 0.2.x 兼容范围与 0.2.2 版本', () => {
+test('package.json 声明 DSH 0.2.x 兼容范围与 0.2.3 版本', () => {
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-  assert.equal(manifest.version, '0.2.2')
+  assert.equal(manifest.version, '0.2.3')
   assert.equal(manifest.engines.node, '>=20')
   // 上界写成 `<0.3.0-0`：0.3.0 的预发布版（0.3.0-rc.1 / rc.2）也因此 UNMET。
   // 该范围语义由宿主 app-boot 的 evaluatePluginCompatibility 验证：
   // 0.2.2-rc.1 → COMPATIBLE；0.3.0-rc.1 / 0.3.0-rc.2 / 0.3.0 → UNMET（见 CHANGELOG 0.2.1）。
   assert.equal(manifest.engines.dsh, '>=0.2.0 <0.3.0-0')
+})
+
+test('配置面板的「取消」按钮有真实处理函数，不再翻转已废弃的 editing 标记', () => {
+  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  assert.match(text, /onClick: cancel/)
+  assert.match(text, /function cancel\(\)/)
+  assert.match(text, /store\.set\(\{ open: false \}\)/)
+  assert.doesNotMatch(text, /editing/)
 })
 
 test('client 的强制刷新请求带 application/json 内容类型', () => {

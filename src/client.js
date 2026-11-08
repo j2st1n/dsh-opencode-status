@@ -107,7 +107,6 @@ window.__ModuleLoader__.load({
     const store = {
       state: {
         open: false,
-        editing: false,
         status: null,
         config: null,
         refreshing: false,
@@ -218,7 +217,7 @@ window.__ModuleLoader__.load({
               margin: '2px auto',
             },
             title: st?.error?.message || `OpenCode GO ${value || ''}`,
-            onClick: () => store.set({ open: !state.open, editing: false }),
+            onClick: () => store.set({ open: !state.open }),
           },
           st?.monthlyUsedPct !== null && st?.monthlyUsedPct !== undefined ? `${st.monthlyUsedPct}%` : 'GO',
         )
@@ -243,7 +242,7 @@ window.__ModuleLoader__.load({
             background: state.open ? 'var(--dsw-alias-interactive-bg-hover, rgba(59,130,246,.12))' : 'transparent',
           },
           onClick: () => {
-            store.set({ open: !state.open, editing: false })
+            store.set({ open: !state.open })
             if (!state.open) {
               refreshStatus(false)
               refreshConfig()
@@ -375,7 +374,7 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ baseUrl, ...(apiKey ? { apiKey } : {}) }),
           })
-          store.set({ status: result.status, config: result.config, editing: false })
+          store.set({ status: result.status, config: result.config })
           setApiKey('')
         } catch (e) {
           setError(e?.message ?? '保存失败')
@@ -394,12 +393,20 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ baseUrl, clearApiKey: true }),
           })
-          store.set({ status: result.status, config: result.config, editing: false })
+          store.set({ status: result.status, config: result.config })
         } catch (e) {
           setError(e?.message ?? '清除失败')
         } finally {
           setSaving(false)
         }
+      }
+
+      /** 放弃未保存的编辑并关闭面板：重新打开时表单会从已保存的配置重新渲染。 */
+      function cancel() {
+        setBaseUrl(cfg?.baseUrl ?? '')
+        setApiKey('')
+        setError(null)
+        store.set({ open: false })
       }
 
       return h('div', null, [
@@ -430,9 +437,7 @@ window.__ModuleLoader__.load({
             { className: 'oc-btn oc-btn-primary', style: { ...btnBase, background: T.brand, borderColor: T.brand, color: '#fff' }, disabled: saving, onClick: save },
             saving ? '保存中…' : '保存并连接',
           ),
-          state.status?.mode === 'ready'
-            ? h('button', { className: 'oc-btn', style: btnBase, disabled: saving, onClick: () => store.set({ editing: false }) }, '取消')
-            : null,
+          h('button', { className: 'oc-btn', style: btnBase, disabled: saving, onClick: cancel }, '取消'),
           keyState.configured && keyState.writable
             ? h('button', { className: 'oc-btn', style: { ...btnBase, color: T.err, marginLeft: 'auto' }, disabled: saving, onClick: clearKey }, '清除')
             : null,
@@ -463,7 +468,7 @@ window.__ModuleLoader__.load({
         const handleClickOutside = (e) => {
           if (panelRef.current && !panelRef.current.contains(e.target)) {
             const isBtn = e.target.closest && e.target.closest('.oc-footer-btn')
-            if (!isBtn) store.set({ open: false, editing: false })
+            if (!isBtn) store.set({ open: false })
           }
         }
         window.addEventListener('mousedown', handleClickOutside)
@@ -543,7 +548,7 @@ window.__ModuleLoader__.load({
                     color: T.secondary,
                     background: 'transparent',
                   },
-                  onClick: () => store.set({ open: false, editing: false }),
+                  onClick: () => store.set({ open: false }),
                   title: '关闭',
                 },
                 '✕',
