@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2
+
+- 修复 content-type 回归用例被 Host fence 掩盖的问题：原用例没带 `Host`，请求在来源检查阶段就被拒绝，因此删掉 content-type 校验后测试仍然全绿。现在用例明确带可信 `Host`、断言 `415 UNSUPPORTED_MEDIA_TYPE` 与错误消息，并校验凭据未被修改。
+- `GET` 路由补上与写请求相同的 Host/来源 fence，闭合 DNS rebinding 的读取路径（此前攻击者可读取配额、`baseUrl` 与密钥尾四位掩码）。默认部署（loopback / bind 地址 / `connection.trustedHosts`）不受影响；宿主提供 `connection.isTrusted` 时，读与写都委托官方判定。
+- 写请求 content-type 不合法时由 `403 FORBIDDEN` 改为 `415 UNSUPPORTED_MEDIA_TYPE`，与宿主 `client-connection` 的语义保持一致。
+- 新增两条回归：GET 的 rebinding / 缺 Host / loopback 放行；`connection.isTrusted` 委托在读写两条路径上的放行与拒绝。
+- 文档：README 安全说明区分「默认部署只监听 loopback」与「绑定其它地址时依赖 bind 地址白名单或 `trustedHosts`」，补充读路径 fence 与 415 语义；修复 CHANGELOG 中重复的 `## 0.2.0` 标题。
+- 测试增至 25 个用例。
+
 ## 0.2.1
 
 - package.json 增加 `engines.dsh: ">=0.2.0 <0.3.0-0"` 兼容声明，版本升到 0.2.1。上界写成 `<0.3.0-0` 是为了让 0.3.0 的预发布版同样 UNMET；已用宿主 app-boot 的 `evaluatePluginCompatibility` 实测：`0.2.2-rc.1` → COMPATIBLE，`0.3.0-rc.1` / `0.3.0-rc.2` / `0.3.0` → UNMET（旧的 `>=0.2.0 <0.3.0` 会把 `0.3.0-rc.1`、`0.3.0-rc.2` 误判为 COMPATIBLE）。
@@ -9,8 +18,6 @@
 - 客户端强制刷新（`POST /api/opencode-status/sync`）补上 `content-type: application/json`，避免被新的写请求防护拦截。
 - 测试增至 23 个用例，新增 malformed JSON→400、跨源 Origin→403、非 JSON content-type→403、热改配置缓存失效、`engines.dsh` 与客户端请求头断言，以及 DNS rebinding→403（零写入）与 loopback/localhost/bind/trustedHosts 浏览器形态→200 两条回归。
 - 残余风险（后续项）：写端点只做来源校验、不做浏览器会话鉴权，同机进程仍可直接访问 loopback 端点；后续可把写操作迁到带鉴权的 `/api` RPC（复用宿主 `connection.admit` 的 Peer 鉴权）。
-
-## 0.2.0
 
 ## 0.2.0
 

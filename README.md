@@ -57,16 +57,16 @@ dsh plugin --profile web remove dsh-opencode-status
 
 ## 安全说明
 
-- 仅监听本机 loopback，所有响应带 `Cache-Control: no-store`。
-- `PUT` / `POST` 写请求使用与宿主 `client-connection` 对齐的来源防护：
-  - `content-type` 必须为 `application/json`（允许 `charset` 参数）；
-  - **Host 白名单**：Host 必须可解析，且 hostname 属于 loopback（`localhost`、`[::1]`、`127/8`）、等于监听器 bind 地址（`ctx.webServer.host`），或命中 `ctx.get('connection')?.trustedHosts`；宿主提供官方 `isTrusted(req)` 时直接采用其结论。这阻断了 DNS rebinding（攻击者域名解析到本机后借用浏览器发起写请求）；
+- 默认部署只监听本机 loopback，所有响应带 `Cache-Control: no-store`；绑定其它地址时（`--host` / 反代），写请求是否放行取决于 bind 地址白名单与 `connection.trustedHosts`。
+- `GET` 与 `PUT` / `POST` 共用同一套 Host/来源防护，读路径同样会拒绝 DNS rebinding（攻击者页面无法读取配额、`baseUrl` 或密钥掩码）：
+  - **Host 白名单**：Host 必须可解析，且 hostname 属于 loopback（`localhost`、`[::1]`、`127/8`）、等于监听器 bind 地址（`ctx.webServer.host`），或命中 `ctx.get('connection')?.trustedHosts`；宿主提供官方 `isTrusted(req)` 时直接采用其结论；
   - 请求带 `sec-fetch-site: cross-site` 时直接拒绝；
-  - 带 `Origin` 头时必须是同一 authority（Host 的默认端口按 Origin 的 scheme 归一化，对齐 `isSameAuthorityOrigin`），否则返回 `403 FORBIDDEN`，且不会写入凭据或配置。
-- `GET` 不受写防护影响；不支持的写方法仍返回 `405`。
+  - 带 `Origin` 头时必须是同一 authority（Host 的默认端口按 Origin 的 scheme 归一化，对齐 `isSameAuthorityOrigin`），否则返回 `403 FORBIDDEN`，且不会读取或写入凭据与配置。
+- 写请求在上述防护之外还要求 `content-type: application/json`（允许 `charset` 参数），不满足时返回 `415 UNSUPPORTED_MEDIA_TYPE`（与宿主 `client-connection` 语义一致）。
+- 不支持的方法仍返回 `405`（先于来源判定）。
 - 请求体上限 64KB，超出返回 `413`；JSON 解析失败返回 `400`（错误码 `INVALID`）。
 - API Key 只在宿主凭据库中保存，HTTP 响应仅回传尾 4 位掩码。
-- **残余风险**：写端点只做来源校验，不做浏览器会话鉴权，同机进程仍可直接访问 loopback 端点；后续可把写操作迁到带鉴权的 `/api` RPC（复用宿主 `connection.admit` 的 Peer 鉴权）。
+- **残余风险**：端点只做来源校验，不做浏览器会话鉴权，同机进程仍可直接访问 loopback 端点；后续可把操作迁到带鉴权的 `/api` RPC（复用宿主 `connection.admit` 的 Peer 鉴权）。
 
 ## License
 

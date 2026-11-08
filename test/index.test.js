@@ -501,36 +501,89 @@ test('写请求跨源 Origin 返回 403，且不触碰凭据与配置', async ()
   }
 })
 
-test('写请求 content-type 非 application/json 返回 403，GET 与 405 分支不变', async () => {
+test('写请求 content-type 非 application/json 返回 415，GET 与 405 分支不变', async () => {
   const app = harness({ credentials: { [DEFAULT_KEY_REF]: 'content-type-key' } })
   const configRoute = app.routes.get('/api/opencode-status/config')
   const syncRoute = app.routes.get('/api/opencode-status/sync')
 
+  // 带可信 Host：判定必须落在 content-type 分支，而不是被来源 fence 提前拒绝。
   const plain = await invoke(configRoute, 'PUT', '/api/opencode-status/config', { baseUrl: DEFAULT_BASE_URL }, {
-    headers: { 'content-type': 'text/plain' },
+    headers: { 'content-type': 'text/plain', host: '127.0.0.1:3080' },
   })
-  assert.equal(plain.status, 403)
-  assert.equal(plain.body.error.code, 'FORBIDDEN')
+  assert.equal(plain.status, 415)
+  assert.equal(plain.body.error.code, 'UNSUPPORTED_MEDIA_TYPE')
+  assert.equal(plain.body.error.message, '写请求必须使用 application/json')
+  assert.equal(app.credentials.get(DEFAULT_KEY_REF), 'content-type-key')
 
   const missing = await invoke(configRoute, 'PUT', '/api/opencode-status/config', { baseUrl: DEFAULT_BASE_URL }, {
-    headers: {},
+    headers: { host: '127.0.0.1:3080' },
   })
-  assert.equal(missing.status, 403)
+  assert.equal(missing.status, 415)
+  assert.equal(missing.body.error.code, 'UNSUPPORTED_MEDIA_TYPE')
 
   const syncPlain = await invoke(syncRoute, 'POST', '/api/opencode-status/sync', undefined, {
-    headers: { 'content-type': 'text/plain' },
+    headers: { 'content-type': 'text/plain', host: '127.0.0.1:3080' },
   })
-  assert.equal(syncPlain.status, 403)
+  assert.equal(syncPlain.status, 415)
 
-  // GET 不做写请求校验。
+  // GET 不做 content-type 校验（仍受来源 fence 保护）。
   const get = await invoke(configRoute, 'GET', '/api/opencode-status/config', undefined, {
-    headers: { 'content-type': 'text/plain' },
+    headers: { 'content-type': 'text/plain', host: '127.0.0.1:3080' },
   })
   assert.equal(get.status, 200)
 
   // 不被支持的写方法仍走 405。
   assert.equal((await invoke(configRoute, 'DELETE', '/api/opencode-status/config', undefined, { headers: {} })).status, 405)
   assert.equal((await invoke(syncRoute, 'PUT', '/api/opencode-status/sync', undefined, { headers: {} })).status, 405)
+})
+
+test('GET 路由同样做 Host/来源 fence，阻断 DNS rebinding 的读取路径', async () => {
+  // 不配置密钥：needs_config 在发起上游请求前直接返回，不需要 stub fetch。
+  const app = harness({ config: { baseUrl: DEFAULT_BASE_URL } })
+  const statusRoute = app.routes.get('/api/opencode-status')
+  const configRoute = app.routes.get('/api/opencode-status/config')
+
+  const rebound = await invoke(statusRoute, 'GET', '/api/opencode-status', undefined, {
+    headers: { host: 'evil.example.test:3080', origin: 'http://evil.example.test:3080' },
+  })
+  assert.equal(rebound.status, 403)
+  assert.equal(rebound.body.error.code, 'FORBIDDEN')
+
+  const reboundConfig = await invoke(configRoute, 'GET', '/api/opencode-status/config', undefined, {
+    headers: { host: 'evil.example.test:3080' },
+  })
+  assert.equal(reboundConfig.status, 403)
+
+  const noHost = await invoke(statusRoute, 'GET', '/api/opencode-status', undefined, { headers: {} })
+  assert.equal(noHost.status, 403)
+
+  const loopback = await invoke(configRoute, 'GET', '/api/opencode-status/config', undefined, {
+    headers: { host: '127.0.0.1:3080' },
+  })
+  assert.equal(loopback.status, 200)
+  assert.equal(loopback.body.apiKey.configured, false)
+})
+
+test('宿主提供 connection.isTrusted 时读与写都委托官方判定', async () => {
+  const app = harness({ connection: { isTrusted: (req) => req.headers?.host === 'harness.internal:3080' } })
+  const configRoute = app.routes.get('/api/opencode-status/config')
+
+  // 官方判定拒绝的 Host 即便看起来像 loopback 也不放行。
+  const rejectedRead = await invoke(configRoute, 'GET', '/api/opencode-status/config', undefined, {
+    headers: { host: '127.0.0.1:3080' },
+  })
+  assert.equal(rejectedRead.status, 403)
+
+  // 官方判定认可的 Host 即便不是 loopback 也放行。
+  const allowedRead = await invoke(configRoute, 'GET', '/api/opencode-status/config', undefined, {
+    headers: { host: 'harness.internal:3080' },
+  })
+  assert.equal(allowedRead.status, 200)
+
+  const allowedWrite = await invoke(configRoute, 'PUT', '/api/opencode-status/config', { baseUrl: DEFAULT_BASE_URL }, {
+    headers: { 'content-type': 'application/json', host: 'harness.internal:3080' },
+  })
+  assert.equal(allowedWrite.status, 200)
 })
 
 test('热改 baseUrl / keyRef 后缓存立即失效，下一次 GET 重新拉取', async () => {
@@ -580,9 +633,9 @@ test('热改 baseUrl / keyRef 后缓存立即失效，下一次 GET 重新拉取
   }
 })
 
-test('package.json 声明 DSH 0.2.x 兼容范围与 0.2.1 版本', () => {
+test('package.json 声明 DSH 0.2.x 兼容范围与 0.2.2 版本', () => {
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-  assert.equal(manifest.version, '0.2.1')
+  assert.equal(manifest.version, '0.2.2')
   assert.equal(manifest.engines.node, '>=20')
   // 上界写成 `<0.3.0-0`：0.3.0 的预发布版（0.3.0-rc.1 / rc.2）也因此 UNMET。
   // 该范围语义由宿主 app-boot 的 evaluatePluginCompatibility 验证：

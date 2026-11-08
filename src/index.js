@@ -383,7 +383,7 @@ export function apply(ctx, config = {}) {
   }
 
   /** 优先使用宿主的官方 fence，缺失 connection 服务时回退到等价的本地实现。 */
-  function isTrustedWriteRequest(req) {
+  function isTrustedRequest(req) {
     const connection = connectionService()
     if (connection !== undefined && typeof connection.isTrusted === 'function') {
       return readService(() => connection.isTrusted(req)) === true
@@ -391,21 +391,37 @@ export function apply(ctx, config = {}) {
     return trustedByLocalFence(req)
   }
 
-  /** 写请求防护：先做 Host/来源白名单（DNS rebinding 与跨站防护），再校验请求内容类型。 */
-  function assertSameOrigin(req) {
-    const headers = req.headers ?? {}
-    if (!isTrustedWriteRequest(req)) {
-      throw Object.assign(new Error('拒绝不可信的写请求来源'), { statusCode: 403, code: 'FORBIDDEN' })
-    }
-    if (!isJsonContentType(headers['content-type'])) {
-      throw Object.assign(new Error('写请求必须使用 application/json'), { statusCode: 403, code: 'FORBIDDEN' })
+  /**
+   * 读请求防护：与写请求共用同一套 Host/来源白名单。
+   * 只读路径同样会被 DNS rebinding 利用（攻击者页面可读取 baseUrl、掩码与用配额），
+   * 因此 GET 不再放行任意来源。
+   */
+  function assertTrustedRead(req) {
+    if (!isTrustedRequest(req)) {
+      throw Object.assign(new Error('拒绝不可信的读请求来源'), { statusCode: 403, code: 'FORBIDDEN' })
     }
   }
 
-  function guard(handler, writeMethods = []) {
+  /** 写请求防护：先做 Host/来源白名单（DNS rebinding 与跨站防护），再校验请求内容类型。 */
+  function assertTrustedWrite(req) {
+    if (!isTrustedRequest(req)) {
+      throw Object.assign(new Error('拒绝不可信的写请求来源'), { statusCode: 403, code: 'FORBIDDEN' })
+    }
+    if (!isJsonContentType((req.headers ?? {})['content-type'])) {
+      // 与宿主 client-connection 对齐：实体格式不受支持时返回 415，而不是 403。
+      throw Object.assign(new Error('写请求必须使用 application/json'), {
+        statusCode: 415,
+        code: 'UNSUPPORTED_MEDIA_TYPE',
+      })
+    }
+  }
+
+  function guard(handler, { writeMethods = [], fencedRead = false } = {}) {
     return async (req, res) => {
       try {
-        if (writeMethods.includes(String(req.method ?? '').toUpperCase())) assertSameOrigin(req)
+        const method = String(req.method ?? '').toUpperCase()
+        if (writeMethods.includes(method)) assertTrustedWrite(req)
+        else if (fencedRead && method === 'GET') assertTrustedRead(req)
         await handler(req, res)
       } catch (error) {
         sendJson(res, error?.statusCode ?? 500, {
@@ -424,7 +440,7 @@ export function apply(ctx, config = {}) {
         if (req.method !== 'GET') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET only' } })
         const force = new URL(req.url ?? '/', 'http://localhost').searchParams.has('force')
         sendJson(res, 200, await buildStatus(force))
-      }),
+      }, { fencedRead: true }),
     }),
   )
 
@@ -480,7 +496,7 @@ export function apply(ctx, config = {}) {
           config: await publicConfig(baseUrl),
           status: await buildStatus(true, baseUrl),
         })
-      }, ['PUT']),
+      }, { writeMethods: ['PUT'], fencedRead: true }),
     }),
   )
 
@@ -492,7 +508,7 @@ export function apply(ctx, config = {}) {
       handler: guard(async (req, res) => {
         if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'POST only' } })
         sendJson(res, 200, await buildStatus(true))
-      }, ['POST']),
+      }, { writeMethods: ['POST'] }),
     }),
   )
 }
