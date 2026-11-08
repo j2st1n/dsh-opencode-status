@@ -138,7 +138,10 @@ window.__ModuleLoader__.load({
     async function refreshStatus(force = false) {
       try {
         const status = force
-          ? await api('/api/opencode-status/sync', { method: 'POST' })
+          ? await api('/api/opencode-status/sync', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+            })
           : await api('/api/opencode-status')
         store.set({ status, error: null })
       } catch (err) {

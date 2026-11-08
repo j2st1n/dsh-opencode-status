@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.1
+
+- package.json 增加 `engines.dsh: ">=0.2.0 <0.3.0-0"` 兼容声明，版本升到 0.2.1。上界写成 `<0.3.0-0` 是为了让 0.3.0 的预发布版同样 UNMET；已用宿主 app-boot 的 `evaluatePluginCompatibility` 实测：`0.2.2-rc.1` → COMPATIBLE，`0.3.0-rc.1` / `0.3.0-rc.2` / `0.3.0` → UNMET（旧的 `>=0.2.0 <0.3.0` 会把 `0.3.0-rc.1`、`0.3.0-rc.2` 误判为 COMPATIBLE）。
+- 请求体 JSON 解析失败时返回 `400` + 错误码 `INVALID`（此前会落到 guard 的 500）；`64KB` 请求体上限仍返回 `413`，非对象 JSON 同样返回 `400 INVALID`。
+- 状态缓存（30s TTL）命中条件增加 baseUrl 与 keyRef 比对：在设置页热改配置后，下一次 `GET /api/opencode-status` 立即重新拉取，不再等 TTL 过期；`PUT` 里的显式缓存失效保留。
+- `PUT` / `POST` 写请求增加与宿主 `client-connection` 对齐的来源防护：`content-type` 必须为 `application/json`（允许 charset）；`Host` 白名单要求 hostname 属于 loopback（`localhost`、`[::1]`、`127/8`）、等于 `ctx.webServer.host` 的 bind 地址，或命中 `ctx.get('connection')?.trustedHosts`（宿主提供官方 `isTrusted(req)` 时直接采用其结论）；拒绝 `sec-fetch-site: cross-site`；带 `Origin` 时必须是同一 authority（`Host` 的默认端口按 `Origin` 的 scheme 归一化，对齐 `isSameAuthorityOrigin`）。否则返回 `403 FORBIDDEN` 且不触碰凭据与配置。`GET` 行为不变，不支持的写方法仍返回 `405`。
+- 客户端强制刷新（`POST /api/opencode-status/sync`）补上 `content-type: application/json`，避免被新的写请求防护拦截。
+- 测试增至 23 个用例，新增 malformed JSON→400、跨源 Origin→403、非 JSON content-type→403、热改配置缓存失效、`engines.dsh` 与客户端请求头断言，以及 DNS rebinding→403（零写入）与 loopback/localhost/bind/trustedHosts 浏览器形态→200 两条回归。
+- 残余风险（后续项）：写端点只做来源校验、不做浏览器会话鉴权，同机进程仍可直接访问 loopback 端点；后续可把写操作迁到带鉴权的 `/api` RPC（复用宿主 `connection.admit` 的 Peer 鉴权）。
+
+## 0.2.0
+
+## 0.2.0
+
+- 适配 DSH 0.2.x：宿主端改用官方 `Config`（schemastery）schema，`baseUrl` 与 `keyRef` 声明为 `volatile` 字段，删除已被移除的旧配置注册调用，修复插件在 0.2.2-rc.1 上无法激活的问题。
+- `apply(ctx, config)` 同时兼容 plain 配置值与 volatile live ref（`{ get() }` 形态），字段缺失时回退到环境变量 / 官方端点与默认密钥引用。
+- Base URL 修改通过宿主的 settings 服务持久化到 profile 条目 `opencode-status`；宿主未提供该服务或写入失败时返回 `SETTINGS_UNAVAILABLE` / `PERSIST_FAILED` 的 409 响应，不再抛到路由外。
+- 保持对外行为不变：4 个 HTTP 端点（含 GET/PUT 配置与 POST 同步）的状态码与响应结构、30s 缓存、10s 超时、64KB 请求体上限、`no-store`、405 分支、密钥脱敏提示与错误码均未改变；API Key 仍只存放于 credentials。
+- 依赖升级到 `@deepseek-ai/schemastery@^3.19.0`（volatile 字段支持）。
+- 测试迁移到新的 Config 读取路径，并补充 volatile ref、settings 成功 / 缺失 / 失败三条路径与 Config 导出断言。
+
 ## 0.1.5
 
 - 消除点击弹窗中的重复进度条展示：用量进度条与倒计时全部由 220ms 悬浮微卡呈现（免点即看），点击按钮直达「⚙ OpenCode GO 连接配置」管理卡片（配置 Base URL、设置 API Key、清除 Key 与强制同步）。
