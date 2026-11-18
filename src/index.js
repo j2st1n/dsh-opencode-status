@@ -53,6 +53,12 @@ function isJsonContentType(value) {
   return typeof value === 'string' && /^application\/json\s*(?:;|$)/i.test(value.trim())
 }
 
+/** 百分比取整并钳制到 0–100：上游给小数或越界值时，界面不会出现 12.34% 或 120%。 */
+function normalizePct(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  return Math.round(Math.min(100, Math.max(0, value)))
+}
+
 /** 读取请求头；Node 的 headers 是名字归一化后的普通对象。 */
 function headerValue(headers, name) {
   const value = headers?.[name]
@@ -154,6 +160,8 @@ async function fetchUsageFromGateway(baseUrl, apiKey) {
 export function apply(ctx, config = {}) {
   /** @type {{ at: number, baseUrl: string, keyRef: string, data: any } | null} */
   let usageCache = null
+  // 最后一次成功拉取的时间：失败分支沿用它，避免「上次同步」在拉取失败时反而前移。
+  let lastSuccessAt = null
 
   function invalidateCache() {
     usageCache = null
@@ -265,8 +273,8 @@ export function apply(ctx, config = {}) {
           id: 'rolling',
           label: '滚动窗口 (5h)',
           shortLabel: '5h',
-          usedPct: typeof u.rolling?.percent === 'number' ? u.rolling.percent : null,
-          remainingPct: typeof u.rolling?.percent === 'number' ? Math.max(0, 100 - u.rolling.percent) : null,
+          usedPct: typeof u.rolling?.percent === 'number' ? normalizePct(u.rolling.percent) : null,
+          remainingPct: typeof u.rolling?.percent === 'number' ? normalizePct(100 - u.rolling.percent) : null,
           status: u.rolling?.status ?? 'ok',
           resetAt: u.rolling?.resetsAt ? Date.parse(u.rolling.resetsAt) : null,
         },
@@ -274,8 +282,8 @@ export function apply(ctx, config = {}) {
           id: 'weekly',
           label: '周窗口',
           shortLabel: 'Weekly',
-          usedPct: typeof u.weekly?.percent === 'number' ? u.weekly.percent : null,
-          remainingPct: typeof u.weekly?.percent === 'number' ? Math.max(0, 100 - u.weekly.percent) : null,
+          usedPct: typeof u.weekly?.percent === 'number' ? normalizePct(u.weekly.percent) : null,
+          remainingPct: typeof u.weekly?.percent === 'number' ? normalizePct(100 - u.weekly.percent) : null,
           status: u.weekly?.status ?? 'ok',
           resetAt: u.weekly?.resetsAt ? Date.parse(u.weekly.resetsAt) : null,
         },
@@ -283,8 +291,8 @@ export function apply(ctx, config = {}) {
           id: 'monthly',
           label: '月窗口',
           shortLabel: 'Monthly',
-          usedPct: typeof u.monthly?.percent === 'number' ? u.monthly.percent : null,
-          remainingPct: typeof u.monthly?.percent === 'number' ? Math.max(0, 100 - u.monthly.percent) : null,
+          usedPct: typeof u.monthly?.percent === 'number' ? normalizePct(u.monthly.percent) : null,
+          remainingPct: typeof u.monthly?.percent === 'number' ? normalizePct(100 - u.monthly.percent) : null,
           status: u.monthly?.status ?? 'ok',
           resetAt: u.monthly?.resetsAt ? Date.parse(u.monthly.resetsAt) : null,
         },
@@ -295,17 +303,19 @@ export function apply(ctx, config = {}) {
         mode: 'ready',
         fetchedAt: now,
         config: { baseUrl, hasKey: true },
-        monthlyUsedPct: typeof u.monthly?.percent === 'number' ? u.monthly.percent : null,
+        monthlyUsedPct: typeof u.monthly?.percent === 'number' ? normalizePct(u.monthly.percent) : null,
         windows,
         error: null,
       }
       usageCache = { at: now, baseUrl, keyRef, data: result }
+      lastSuccessAt = now
       return result
     } catch (error) {
       return {
         ok: false,
         mode: 'ready',
-        fetchedAt: now,
+        // 拉取失败不前移「上次同步」：沿用最后一次成功的时间；从未成功过则为 null，界面改说「同步失败」。
+        fetchedAt: lastSuccessAt,
         config: { baseUrl, hasKey: true },
         windows: [],
         error: { code: 'GATEWAY_ERROR', message: String(error?.message ?? error) },
