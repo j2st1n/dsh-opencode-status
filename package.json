@@ -1,6 +1,6 @@
 {
   "name": "dsh-opencode-status",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "OpenCode GO quota status panel for DeepSeek Harness: click to open a usage panel with manual refresh, per-window remaining quota, a hover overview card, and in-app connection settings",
   "type": "module",
   "license": "Apache-2.0",
