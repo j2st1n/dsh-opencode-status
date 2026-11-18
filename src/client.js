@@ -246,19 +246,24 @@ window.__ModuleLoader__.load({
 
     /**
      * 估算文案的三态：不可估算返回 null（调用方完全不渲染节点，不显示 "--"/"估算中" 之类占位）；
-     * 撑不到重置用告警色「约 X 后耗尽」，撑得到用中性色「可支撑到重置」。
+     * 撑不到重置用告警色「X 耗尽」，撑得到用中性色「可支撑到重置」。
      * 文案只用「按当前速率」的描述，不用「预计/将」这种预测口吻。
+     * compact（悬浮微卡，外宽约 220px）整段不展示：一行放不下「名称/条/剩余/估算/倒计时」五项，
+     * 缩字号、砍进度条/倒计时、截断估算都不可接受，所以宁可不显示；估算逻辑仍共用 estimateEta，只是呈现密度不同。
+     * 这是有意为之，不是漏渲染。
      */
-    function etaView(w, now = Date.now()) {
+    function etaView(w, options = {}) {
+      if (options?.compact) return null
       const entry = etaSamples.get(w?.id)
       if (!entry) return null
-      const estimate = estimateEta(entry.samples, w?.remainingPct, w?.resetAt, now)
+      const estimate = estimateEta(entry.samples, w?.remainingPct, w?.resetAt)
       if (!estimate) return null
       const minutes = Math.max(1, Math.round(estimate.spanMs / 60_000))
       // 文案只说「按最近 N 分钟的消耗速率（按当前速率）」的实测依据，不写「预计/将」这类预测口吻。
       const title = `按最近 ${minutes} 分钟的消耗速率估算（按当前速率），仅供参考`
+      // 行内去掉「约/后」压缩到最短（档位徽标 + 长 ETA 同时出现时，保证档位/剩余/倒计时都不被挤掉）。
       return estimate.exhaustsBeforeReset
-        ? { text: `约 ${fmtEtaDuration(estimate.etaMs)} 后耗尽`, color: T.warn, title }
+        ? { text: `${fmtEtaDuration(estimate.etaMs)} 耗尽`, color: T.warn, title }
         : { text: '可支撑到重置', color: T.secondary, title }
     }
 
@@ -640,12 +645,14 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** 悬浮卡紧凑行：名称 / 剩余 % / 估算 / ⏱ 重置倒计时 / 细进度条。 */
+    /** 悬浮卡紧凑行：名称 / 剩余 % / ⏱ 重置倒计时 / 细进度条（紧凑视图不展示估算）。 */
     function MiniQuotaRow(props) {
       const w = props.window
       const remaining = w?.remainingPct ?? null
       const color = remainingColor(remaining)
-      const eta = etaView(w)
+      // compact：悬浮微卡外宽约 220px，五个元素塞不进去。这里整段不渲染估算（etaView 返回 null），
+      // 不缩字号、不砍进度条/倒计时、不截断成残句；面板 QuotaRow 仍照常展示。
+      const eta = etaView(w, { compact: true })
       return h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
         h('span', { key: 'n', style: { width: 46, flexShrink: 0, fontSize: 10, color: T.secondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.shortLabel ?? w?.label ?? '—'),
         h(
@@ -656,9 +663,9 @@ window.__ModuleLoader__.load({
             : h('div', { style: { height: '100%', width: `${clampPct(remaining)}%`, background: color, borderRadius: 2 } }),
         ),
         h('span', { key: 'v', style: { minWidth: 30, flexShrink: 0, textAlign: 'right', fontSize: 10, fontWeight: 600, color, fontVariantNumeric: 'tabular-nums' } }, remaining === null ? '—' : pctText(remaining)),
-        // 与面板行同一套估算：可收缩 ellipsis，数值与倒计时保持 flexShrink:0 不被挤掉。
+        // 紧凑视图不会走到这里（etaView(compact) 恒为 null）；保留非截断样式，避免以后误开时变成残句。
         eta
-          ? h('span', { key: 'e', title: eta.title, style: { flexShrink: 1, minWidth: 0, fontSize: 10, color: eta.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, eta.text)
+          ? h('span', { key: 'e', title: eta.title, style: { flexShrink: 0, fontSize: 10, color: eta.color, whiteSpace: 'nowrap' } }, eta.text)
           : null,
         // 倒计时用 ⏱ 区分刷新动作的 ↻，避免两个图标同义混淆。
         h('span', { key: 'r', style: { minWidth: 34, flexShrink: 0, textAlign: 'right', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } }, w?.resetAt ? `⏱ ${timeUntil(w.resetAt)}` : ''),
@@ -727,9 +734,10 @@ window.__ModuleLoader__.load({
         h('div', { key: 'meta', style: { display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 11, marginBottom: 4, fontVariantNumeric: 'tabular-nums' } }, [
           h('span', { key: 'l', style: { color: T.label, fontWeight: 500, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.label ?? '—'),
           h('span', { key: 'r', title: detail, style: { marginLeft: 'auto', color, fontWeight: 600, flexShrink: 0 } }, remaining === null ? '剩余 —' : `剩余 ${pctText(remaining)}`),
-          // 估算放同一行、不换行不增高；可收缩并用 ellipsis，剩余与倒计时都是 flexShrink:0，绝不会被挤掉。
+          // 估算整段展示、不截断：flexShrink:0 且无 ellipsis；空间不足时只让窗口标签 ellipsis，
+          // 档位徽标（告警不只靠颜色）、剩余 % 与倒计时都不收缩。
           eta
-            ? h('span', { key: 'eta', title: eta.title, style: { flexShrink: 1, minWidth: 0, fontSize: 10, color: eta.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, eta.text)
+            ? h('span', { key: 'eta', title: eta.title, style: { flexShrink: 0, fontSize: 10, color: eta.color, whiteSpace: 'nowrap' } }, eta.text)
             : null,
           // 低额度除颜色外再给文字标记：色觉障碍与灰度截图里也能看出档位。
           band

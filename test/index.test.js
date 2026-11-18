@@ -1510,7 +1510,7 @@ test('估算纯函数：样本不足/跨度不足/速率为 0/回落/缺 resetAt
   // resetAt 缺失或已过期：无法判断能否撑到重置
   assert.equal(estimateEta([mk(now - 20 * min, 0), mk(now - 10 * min, 4), mk(now, 8)], 20, null, now), null)
   assert.equal(estimateEta([mk(now - 20 * min, 0), mk(now - 10 * min, 4), mk(now, 8)], 20, now - min, now), null)
-  // 剩余为 0 时不再给「后耗尽」的荒谬文案
+  // 剩余为 0 时不再给「耗尽」的荒谬文案
   assert.equal(estimateEta([mk(now - 20 * min, 0), mk(now - 10 * min, 4), mk(now, 8)], 0, now + 60 * min, now), null)
 })
 
@@ -1518,7 +1518,7 @@ test('估算纯函数：ETA 短于重置标记耗尽，长于重置标记可支�
   const { estimateEta, fmtEtaDuration } = loadClientForUnit().__internal
   const now = 1_700_000_000_000
   const min = 60_000
-  // 20 分钟用掉 10% → 0.5%/min；剩余 20% → 40 分钟后耗尽
+  // 20 分钟用掉 10% → 0.5%/min；剩余 20% → 40m 耗尽
   const samples = [{ at: now - 20 * min, used: 0 }, { at: now - 10 * min, used: 5 }, { at: now, used: 10 }]
   const short = estimateEta(samples, 20, now + 60 * min, now)
   assert.equal(Math.round(short.etaMs / min), 40)
@@ -1599,7 +1599,7 @@ test('采样裁剪：每窗口最多 120 个样本，且只保留最近 60 分�
   assert.equal(pruned[0].used, 200)
 })
 
-test('三态渲染：可估算才渲染（面板与悬浮卡同一文案），不可估算不渲染任何节点', () => {
+test('三态渲染：面板可估算才渲染（悬浮卡紧凑视图不展示估算），不可估算不渲染任何节点', () => {
   const now = Date.now()
   const min = 60_000
   const resetAt = now + 2 * 3_600_000
@@ -1626,22 +1626,22 @@ test('三态渲染：可估算才渲染（面板与悬浮卡同一文案），�
     }
   }
 
-  // 1) ETA < 距重置（剩余 20% → 约 46m，重置还有 2h）→ 告警色「约 46m 后耗尽」
+  // 1) ETA < 距重置（剩余 20% → 46m，重置还有 2h）→ 告警色「46m 耗尽」
   const shortCase = renderClientTree({ state: stateFor(currentStatus) })
   inject(shortCase.plugin)
   const panelTree = shortCase.panel()
   const panelText = collectNodeText(panelTree).join('|')
-  assert.match(panelText, /约 46m 后耗尽/)
+  assert.match(panelText, /46m 耗尽/)
   assert.match(panelText, /按最近 23 分钟的消耗速率估算（按当前速率），仅供参考/)
-  const exhausted = findNode(panelTree, (text) => text === '约 46m 后耗尽')
+  const exhausted = findNode(panelTree, (text) => text === '46m 耗尽')
   assert.ok(exhausted, '应渲染耗尽估算节点')
   assert.equal(exhausted.type, 'span')
   assert.equal(exhausted.props.style.color, 'var(--dsw-alias-state-warn-primary)')
-  // 布局：不换行、可收缩 ellipsis、不占额外行高
-  assert.equal(exhausted.props.style.flexShrink, 1)
-  assert.equal(exhausted.props.style.minWidth, 0)
+  // 布局：不换行、整段展示不截断（flexShrink:0、无 ellipsis）、不占额外行高
+  assert.equal(exhausted.props.style.flexShrink, 0)
   assert.equal(exhausted.props.style.whiteSpace, 'nowrap')
-  assert.equal(exhausted.props.style.overflow, 'hidden')
+  assert.equal(exhausted.props.style.overflow, undefined)
+  assert.equal(exhausted.props.style.textOverflow, undefined)
   assert.equal(exhausted.props.style.margin, undefined)
   // 「剩余 N%」与「⏱ 倒计时」硬性保留
   const remainingNode = findNode(panelTree, (text) => text === '剩余 20%')
@@ -1650,9 +1650,16 @@ test('三态渲染：可估算才渲染（面板与悬浮卡同一文案），�
   assert.equal(remainingNode.props.style.flexShrink, 0)
   assert.equal(countdownNode.props.style.flexShrink, 0)
   // 同一行（flex 且未换行）
-  const metaRow = findNode(panelTree, (text, node) => node.props?.style?.display === 'flex' && text.includes('剩余 20%') && text.includes('后耗尽'))
+  const metaRow = findNode(panelTree, (text, node) => node.props?.style?.display === 'flex' && text.includes('剩余 20%') && text.includes('46m 耗尽'))
   assert.ok(metaRow, '估算与剩余应在同一条 flex 行内')
   assert.equal(metaRow.props.style.flexWrap, undefined)
+  // 只有窗口标签允许 ellipsis；档位/剩余/ETA/倒计时都不截断
+  const labelNode = findNode(panelTree, (text) => text === '滚动窗口 (5h)')
+  assert.equal(labelNode.props.style.textOverflow, 'ellipsis')
+  assert.equal(labelNode.props.style.minWidth, 0)
+  assert.equal(remainingNode.props.style.textOverflow, undefined)
+  assert.equal(countdownNode.props.style.textOverflow, undefined)
+  assert.equal(exhausted.props.style.textOverflow, undefined)
   // 诚实性：估算文案不出现预测口吻（「即将耗尽」是既有档位标记，单独存在，不算预测）
   assert.doesNotMatch(panelText, /预计|将要|将会/)
 
@@ -1663,27 +1670,71 @@ test('三态渲染：可估算才渲染（面板与悬浮卡同一文案），�
   const supportTree = supportCase.panel()
   const supportText = collectNodeText(supportTree).join('|')
   assert.match(supportText, /可支撑到重置/)
-  assert.doesNotMatch(supportText, /后耗尽/)
+  assert.doesNotMatch(supportText, /\d+\s?耗尽/)
   const supportNode = findNode(supportTree, (text) => text === '可支撑到重置')
   assert.equal(supportNode.props.style.color, 'var(--dsw-alias-label-secondary)')
+  assert.equal(supportNode.props.style.flexShrink, 0)
+  assert.equal(supportNode.props.style.textOverflow, undefined)
 
   // 3) 不可估算（没有任何样本）→ 完全不渲染估算节点，也不出现占位文案
+  //    （「即将耗尽」是既有档位徽标，与估算无关，不能当成 ETA 文案）
   const emptyCase = renderClientTree({ state: stateFor(currentStatus) })
   const emptyTree = emptyCase.panel()
   const emptyText = collectNodeText(emptyTree).join('|')
-  assert.doesNotMatch(emptyText, /后耗尽|可支撑到重置|估算/)
+  assert.doesNotMatch(emptyText, /可支撑到重置|消耗速率/)
+  assert.equal(findNode(emptyTree, (text) => /^\S+ 耗尽$/.test(text)), null)
+  assert.equal(findNode(emptyTree, (text, node) => /^按最近 \d+ 分钟的消耗速率估算/.test(node.props?.title ?? '')), null)
   assert.equal(findNode(emptyTree, (text) => text === '剩余 20%')?.props?.style?.flexShrink, 0)
   // 不留下 "--"/"0m"/"估算中" 之类占位
   assert.equal(findNode(emptyTree, (text) => /^(-{2,}|0m|估算中|--)$/.test(text)), null)
 
-  // 4) 悬浮微卡走同一套估算：文案与面板完全一致（两条渲染路径不漂移）
+  // 4) 最坏组合：最长标签 + 档位徽标（剩余 40 → 偏低）+ 长 ETA + 剩余% + ⏱
+  //    压缩后的 ETA 与档位徽标、剩余%、倒计时都完整渲染且 flexShrink:0，只有标签允许 ellipsis。
+  const bandHistory = [
+    { at: now - 21 * min, used: 0 },
+    { at: now - 11 * min, used: 3.5 },
+    { at: now - min, used: 7 },
+  ]
+  const bandStatus = { ...currentStatus, windows: [{ ...currentStatus.windows[0], usedPct: 60, remainingPct: 40 }] }
+  const bandCase = renderClientTree({ state: stateFor(bandStatus) })
+  for (const sample of bandHistory) {
+    bandCase.plugin.__internal.recordSamples({
+      ok: true,
+      fetchedAt: sample.at,
+      windows: [{ id: 'rolling', usedPct: sample.used, remainingPct: 100 - sample.used, resetAt }],
+    })
+  }
+  const bandTree = bandCase.panel()
+  const bandText = collectNodeText(bandTree).join('|')
+  const bandEta = findNode(bandTree, (text) => /^\S+ 耗尽$/.test(text) && !text.includes('即将耗尽'))
+  assert.ok(bandEta, '档位存在时仍应渲染完整 ETA')
+  assert.equal(bandEta.props.style.textOverflow, undefined)
+  assert.equal(bandEta.props.style.flexShrink, 0)
+  const bandBadge = findNode(bandTree, (text) => text === '⚠ 偏低')
+  assert.ok(bandBadge, '档位徽标不得被砍掉（告警不只靠颜色）')
+  assert.equal(bandBadge.props.style.flexShrink, 0)
+  assert.match(bandText, /剩余 40%/)
+  assert.ok(findNode(bandTree, (text) => text.startsWith('⏱ ')))
+  // 只有标签允许 ellipsis
+  const bandLabel = findNode(bandTree, (text) => text === '滚动窗口 (5h)')
+  assert.equal(bandLabel.props.style.textOverflow, 'ellipsis')
+  assert.equal(findNode(bandTree, (text) => text === '剩余 40%').props.style.textOverflow, undefined)
+
+  // 5) 紧凑模式（悬浮微卡）整段不渲染估算：同一 estimateEta，只是不展示
+  const compactPlugin = shortCase.plugin
+  const windowForEta = { id: 'rolling', remainingPct: 20, resetAt }
+  assert.ok(compactPlugin.__internal.etaView(windowForEta), '面板口径应能给出估算')
+  assert.equal(compactPlugin.__internal.etaView(windowForEta, { compact: true }), null, '紧凑模式必须整段不渲染')
+
+  // 6) 悬浮微卡不渲染 ETA，但剩余% 与 ⏱ 照旧；两条渲染路径共用同一套估算只是呈现密度不同
   const hoverCase = renderClientTree({ state: { ...stateFor(currentStatus), open: false }, forceHover: true })
   inject(hoverCase.plugin)
-  const hoverText = collectNodeText(hoverCase.footer({ wide: true })).join('|')
-  assert.match(hoverText, /约 46m 后耗尽/)
-  assert.match(hoverText, /按最近 23 分钟的消耗速率估算（按当前速率），仅供参考/)
-  // 卡片仍是 aria-hidden 的只读微卡：同一份估算不在读屏里重复播报
   const hoverTree = hoverCase.footer({ wide: true })
+  const hoverText = collectNodeText(hoverTree).join('|')
+  assert.doesNotMatch(hoverText, /耗尽|可支撑到重置|消耗速率/)
+  assert.match(hoverText, /20%/)
+  assert.match(hoverText, /⏱/)
+  // 卡片仍是 aria-hidden 的只读微卡
   const hoverCard = findNode(hoverTree, (text, node) => node.props?.['aria-hidden'] === true)
   assert.ok(hoverCard, '悬浮卡应为 aria-hidden')
 })
