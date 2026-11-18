@@ -791,7 +791,9 @@ test('P1 信息设计：相对时间/过期提示、单一主百分比、免责�
 
   // 头部给判断性摘要，不再与月窗口行重复「月剩余 N%」
   const statusView = text.slice(text.indexOf('function StatusView'), text.indexOf('function QuotaRow'))
-  assert.match(statusView, /最紧张 \$\{tightest\.shortLabel \?\? tightest\.label \?\? '—'\}/)
+  // 头部用 label 而不是 shortLabel：shortLabel 是 220px 悬浮卡的紧凑缩写，复用会把英文漏进主面板
+  assert.match(statusView, /最紧张 \$\{tightest\.label \?\? tightest\.id \?\? '—'\}/)
+  assert.doesNotMatch(statusView, /tightest\.shortLabel/)
   assert.doesNotMatch(statusView, /月剩余/)
   assert.doesNotMatch(statusView, /hostOf\(/)
   // host 只在面板标题行展示一次
@@ -1151,7 +1153,7 @@ test('运行时验证：手动刷新后更早的 GET 成功/失败响应都被�
   await flush()
   const panelText = collect(app.registered[1]()).join('|')
   // 新语义：头部给「最紧张窗口」摘要，窗口行只留剩余主百分比，已用降级到 aria/title
-  assert.match(panelText, /最紧张 Monthly 90%/)
+  assert.match(panelText, /最紧张 月窗口 90%/)
   assert.match(panelText, /剩余 90%/)
   assert.match(panelText, /已用 10%/)
   assert.doesNotMatch(panelText, /剩余 10%|已用 90%/)
@@ -1169,7 +1171,7 @@ test('运行时验证：手动刷新后更早的 GET 成功/失败响应都被�
   oldGet2.reject(new Error('stale GET failed'))
   await flush()
   const panelText2 = collect(app2.registered[1]()).join('|')
-  assert.match(panelText2, /最紧张 Monthly 90%/)
+  assert.match(panelText2, /最紧张 月窗口 90%/)
   assert.doesNotMatch(panelText2, /刷新失败/)
 })
 
@@ -1755,4 +1757,48 @@ test('ETA 粗化：按两位有效数字取整，不暗示分钟级精度', () =
   assert.equal(coarsenEta(790 * m), 780 * m)
   // ≥48h：取 1 天（82h → 3d）
   assert.equal(coarsenEta(82 * 60 * m), 72 * 60 * m)
+})
+
+test('采样中提示：有样本但未攒够时给出进度，攒够后让位给真实估算', () => {
+  const now = Date.now()
+  const min = 60_000
+  const resetAt = now + 2 * 3_600_000
+  const currentStatus = {
+    ok: true,
+    mode: 'ready',
+    fetchedAt: now - min,
+    config: { baseUrl: 'https://opencode.ai/zen/go' },
+    windows: [{ id: 'rolling', label: '滚动窗口 (5h)', shortLabel: '5h', usedPct: 10, remainingPct: 20, status: 'ok', resetAt }],
+  }
+  const stateFor = (status) => ({ open: true, view: 'status', status, config: { baseUrl: 'https://opencode.ai/zen/go' }, refreshing: false, error: null })
+  const feed = (plugin, samples) => {
+    for (const s of samples) {
+      plugin.__internal.recordSamples({ ok: true, fetchedAt: s.at, windows: [{ id: 'rolling', usedPct: s.used, remainingPct: 100 - s.used, resetAt }] })
+    }
+  }
+
+  // 1) 只有 2 个点、跨度 1 分钟 → 显示「采样中」，且不出现任何 ETA 数字
+  const warming = renderClientTree({ state: stateFor(currentStatus) })
+  feed(warming.plugin, [{ at: now - 2 * min, used: 8 }, { at: now - min, used: 10 }])
+  const warmingTree = warming.panel()
+  const warmingText = collectNodeText(warmingTree).join('|')
+  assert.match(warmingText, /采样中/)
+  assert.doesNotMatch(warmingText, /后耗尽|可支撑到重置/)
+  const hint = findNode(warmingTree, (text) => text === '采样中')
+  assert.ok(hint, '应渲染采样中提示')
+  assert.match(hint.props.title, /需要 3 个点且跨度满 10 分钟/)
+  // 仍是纯展示文案，不抢布局：不截断、不收缩
+  assert.equal(hint.props.style.flexShrink, 0)
+
+  // 2) 悬浮微卡（compact）不显示采样提示
+  const hoverCase = renderClientTree({ state: { ...stateFor(currentStatus), open: false }, forceHover: true })
+  feed(hoverCase.plugin, [{ at: now - 2 * min, used: 8 }, { at: now - min, used: 10 }])
+  assert.doesNotMatch(collectNodeText(hoverCase.footer({ wide: true })).join('|'), /采样中/)
+
+  // 3) 样本攒够且速率 > 0 → 采样中让位给真实估算
+  const ready = renderClientTree({ state: stateFor(currentStatus) })
+  feed(ready.plugin, [{ at: now - 20 * min, used: 0 }, { at: now - 12 * min, used: 5 }, { at: now - min, used: 10 }])
+  const readyText = collectNodeText(ready.panel()).join('|')
+  assert.doesNotMatch(readyText, /采样中/)
+  assert.match(readyText, /后耗尽/)
 })

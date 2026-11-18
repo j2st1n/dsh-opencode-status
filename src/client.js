@@ -271,9 +271,22 @@ window.__ModuleLoader__.load({
     function etaView(w, options = {}) {
       if (options?.compact) return null
       const entry = etaSamples.get(w?.id)
-      if (!entry) return null
+      if (!entry || !entry.samples.length) return null
       const estimate = estimateEta(entry.samples, w?.remainingPct, w?.resetAt)
-      if (!estimate) return null
+      if (!estimate) {
+        // 「采样中」只在样本数或跨度还不够时出现：让用户能区分「功能没加载」与「还在攒数据」。
+        // 速率 0、剩余 0、重置缺失或已过期都不是采样问题，仍然什么都不显示。
+        const samples = entry.samples
+        const span = samples[samples.length - 1].at - samples[0].at
+        if (samples.length >= ETA_MIN_SAMPLES && span >= ETA_MIN_SPAN_MS) return null
+        if (typeof w?.remainingPct !== 'number' || w.remainingPct <= 0) return null
+        if (!w?.resetAt || w.resetAt <= Date.now()) return null
+        return {
+          text: '采样中',
+          color: T.secondary,
+          title: `正在积累采样：已有 ${samples.length} 个点、跨度约 ${Math.max(1, Math.round(span / 60_000))} 分钟；需要 ${ETA_MIN_SAMPLES} 个点且跨度满 ${ETA_MIN_SPAN_MS / 60_000} 分钟`,
+        }
+      }
       const minutes = Math.max(1, Math.round(estimate.spanMs / 60_000))
       // 文案只说「按最近 N 分钟的消耗速率（按当前速率）」的实测依据，不写「预计/将」这类预测口吻。
       const title = `按最近 ${minutes} 分钟的消耗速率估算（按当前速率），仅供参考`
@@ -707,7 +720,8 @@ window.__ModuleLoader__.load({
       return h('div', null, [
         h('div', { key: 'sum', style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
           h('span', { key: 'd', style: dotStyle(st.ok ? T.ok : T.err) }),
-          h('span', { key: 't', style: { fontSize: 12, fontWeight: 600, color: T.label } }, st.ok ? 'OpenCode GO 已连接' : 'OpenCode GO 异常'),
+          // 窄视口下让标题让位给右侧摘要：摘要 flexShrink:0，标题可省略。
+          h('span', { key: 't', style: { fontSize: 12, fontWeight: 600, color: T.label, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 1 } }, st.ok ? 'OpenCode GO 已连接' : 'OpenCode GO 异常'),
           tightest
             ? h(
                 'span',
@@ -717,7 +731,9 @@ window.__ModuleLoader__.load({
                   title: `最紧张窗口：${tightest.label ?? tightest.id ?? '—'}，剩余 ${pctText(tightest.remainingPct)}`,
                   style: { marginLeft: 'auto', fontSize: 11, fontWeight: 600, color: remainingColor(tightest.remainingPct), fontVariantNumeric: 'tabular-nums', flexShrink: 0 },
                 },
-                `最紧张 ${tightest.shortLabel ?? tightest.label ?? '—'} ${pctText(tightest.remainingPct)}`,
+                // 用 label 而不是 shortLabel：shortLabel 是给 220px 悬浮微卡的窄列设计的紧凑缩写，
+                // 复用到这里会把「Weekly / Monthly」这类英文缩写漏进主面板。
+                `最紧张 ${tightest.label ?? tightest.id ?? '—'} ${pctText(tightest.remainingPct)}`,
               )
             : null,
         ].filter(Boolean)),

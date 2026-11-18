@@ -287,7 +287,7 @@ export function apply(ctx, config = {}) {
         {
           id: 'weekly',
           label: '周窗口',
-          shortLabel: 'Weekly',
+          shortLabel: '周',
           ...pctPair(u.weekly?.percent),
           status: u.weekly?.status ?? 'ok',
           resetAt: u.weekly?.resetsAt ? Date.parse(u.weekly.resetsAt) : null,
@@ -295,7 +295,7 @@ export function apply(ctx, config = {}) {
         {
           id: 'monthly',
           label: '月窗口',
-          shortLabel: 'Monthly',
+          shortLabel: '月',
           ...pctPair(u.monthly?.percent),
           status: u.monthly?.status ?? 'ok',
           resetAt: u.monthly?.resetsAt ? Date.parse(u.monthly.resetsAt) : null,
