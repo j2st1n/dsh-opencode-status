@@ -170,6 +170,109 @@ window.__ModuleLoader__.load({
       return tightest
     }
 
+    // ---------- 消耗速率估算（按当前速率还能撑多久） ----------
+    // 采样放模块级而不是 store：每次采样不触发整树重渲染，渲染时按需读取。
+    const ETA_SAMPLE_WINDOW_MS = 60 * 60_000
+    const ETA_MAX_SAMPLES = 120
+    const ETA_MIN_SAMPLES = 3
+    const ETA_MIN_SPAN_MS = 10 * 60_000
+
+    /** windowId -> { resetAt, samples: [{ at, used }] }；at 取 status.fetchedAt（不是 Date.now）。 */
+    const etaSamples = new Map()
+
+    /**
+     * 记录一次成功刷新的样本：按窗口分组，用 fetchedAt 去重（宿主 30s 缓存会让多次轮询拿到同一个时间），
+     * usedPct 回落或 resetsAt 变化说明窗口已重置，立即清空该窗口历史重新采样，避免算出负数或荒谬 ETA。
+     */
+    function recordSamples(status) {
+      if (!status?.ok || typeof status.fetchedAt !== 'number') return
+      const windows = Array.isArray(status.windows) ? status.windows : []
+      for (const w of windows) {
+        const id = w?.id
+        if (!id || typeof w?.usedPct !== 'number') continue
+        const at = status.fetchedAt
+        const used = w.usedPct
+        const resetAt = typeof w.resetAt === 'number' && Number.isFinite(w.resetAt) ? w.resetAt : null
+        let entry = etaSamples.get(id)
+        if (!entry) {
+          entry = { resetAt, samples: [] }
+          etaSamples.set(id, entry)
+        }
+        const last = entry.samples[entry.samples.length - 1]
+        if (last && last.at === at) continue // 同一份缓存数据不重复采样
+        if (last && (used < last.used || resetAt !== entry.resetAt)) entry.samples = []
+        entry.resetAt = resetAt
+        entry.samples.push({ at, used })
+        // 只保留最近 60 分钟、每窗口最多 120 个样本。
+        const cutoff = at - ETA_SAMPLE_WINDOW_MS
+        while (entry.samples.length && entry.samples[0].at < cutoff) entry.samples.shift()
+        if (entry.samples.length > ETA_MAX_SAMPLES) entry.samples.splice(0, entry.samples.length - ETA_MAX_SAMPLES)
+      }
+    }
+
+    /**
+     * 估算「按当前速率还能撑多久」。样本 ≥3、首尾跨度 ≥10 分钟、速率 >0 三者缺一即返回 null；
+     * 速率只用首尾两点（不做回归，抗噪且好解释）。resetAt 缺失或已过期时无法判断能否撑到重置，同样返回 null。
+     * 返回 { etaMs, untilResetMs, exhaustsBeforeReset, spanMs }：能否撑到重置由调用方决定怎么展示。
+     */
+    function estimateEta(samples, remainingPct, resetAt, now = Date.now()) {
+      if (!Array.isArray(samples) || samples.length < ETA_MIN_SAMPLES) return null
+      if (typeof remainingPct !== 'number' || !Number.isFinite(remainingPct) || remainingPct <= 0) return null
+      if (typeof resetAt !== 'number' || !Number.isFinite(resetAt)) return null
+      const first = samples[0]
+      const last = samples[samples.length - 1]
+      if (typeof first?.at !== 'number' || typeof last?.at !== 'number') return null
+      if (typeof first?.used !== 'number' || typeof last?.used !== 'number') return null
+      const spanMs = last.at - first.at
+      if (!(spanMs >= ETA_MIN_SPAN_MS)) return null
+      const ratePerMs = (last.used - first.used) / spanMs
+      if (!(ratePerMs > 0)) return null
+      const etaMs = remainingPct / ratePerMs
+      if (!Number.isFinite(etaMs) || etaMs <= 0) return null
+      const untilResetMs = resetAt - now
+      if (!Number.isFinite(untilResetMs) || untilResetMs <= 0) return null
+      return { etaMs, untilResetMs, exhaustsBeforeReset: etaMs < untilResetMs, spanMs }
+    }
+
+    /** 时长短文案：<1h 用分钟，<24h 用 h+m，更长用 d+h（「还能撑多久」不需要精确到分秒）。 */
+    function fmtEtaDuration(ms) {
+      const mins = Math.max(1, Math.round(ms / 60_000))
+      if (mins < 60) return `${mins}m`
+      const hours = Math.floor(mins / 60)
+      if (hours < 24) return `${hours}h${mins % 60 ? `${mins % 60}m` : ''}`
+      const days = Math.floor(hours / 24)
+      return `${days}d${hours % 24 ? `${hours % 24}h` : ''}`
+    }
+
+    /**
+     * 估算文案的三态：不可估算返回 null（调用方完全不渲染节点，不显示 "--"/"估算中" 之类占位）；
+     * 撑不到重置用告警色「约 X 后耗尽」，撑得到用中性色「可支撑到重置」。
+     * 文案只用「按当前速率」的描述，不用「预计/将」这种预测口吻。
+     */
+    function etaView(w, now = Date.now()) {
+      const entry = etaSamples.get(w?.id)
+      if (!entry) return null
+      const estimate = estimateEta(entry.samples, w?.remainingPct, w?.resetAt, now)
+      if (!estimate) return null
+      const minutes = Math.max(1, Math.round(estimate.spanMs / 60_000))
+      // 文案只说「按最近 N 分钟的消耗速率（按当前速率）」的实测依据，不写「预计/将」这类预测口吻。
+      const title = `按最近 ${minutes} 分钟的消耗速率估算（按当前速率），仅供参考`
+      return estimate.exhaustsBeforeReset
+        ? { text: `约 ${fmtEtaDuration(estimate.etaMs)} 后耗尽`, color: T.warn, title }
+        : { text: '可支撑到重置', color: T.secondary, title }
+    }
+
+    /** 仅供测试与诊断：读取某个窗口的采样副本。 */
+    function getSamples(windowId) {
+      const entry = etaSamples.get(windowId)
+      return entry ? entry.samples.map((s) => ({ ...s })) : []
+    }
+
+    /** 仅供测试与诊断：清空所有采样。 */
+    function resetEtaSamples() {
+      etaSamples.clear()
+    }
+
     /** 月窗口剩余百分比；上游只给百分比，不存在金额余额。 */
     function monthlyRemainingOf(status) {
       if (!status) return null
@@ -236,7 +339,10 @@ window.__ModuleLoader__.load({
         try {
           const status = await api('/api/opencode-status')
           // 只接受最新 epoch 的响应：手动刷新之后返回的在途 GET 一律丢弃。
-          if (epoch === statusEpoch) store.set({ status, error: null })
+          if (epoch === statusEpoch) {
+            recordSamples(status)
+            store.set({ status, error: null })
+          }
         } catch (err) {
           if (epoch === statusEpoch) store.set({ error: String(err?.message ?? err) })
         } finally {
@@ -265,6 +371,7 @@ window.__ModuleLoader__.load({
           headers: { 'content-type': 'application/json' },
         })
         // 手动刷新自身的响应始终落库（刷新期间已阻止新的 GET）。
+        recordSamples(status)
         store.set({ status, error: null })
       } catch (err) {
         store.set({ error: String(err?.message ?? err) })
@@ -533,11 +640,12 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** 悬浮卡紧凑行：名称 / 剩余 % / ⏱ 重置倒计时 / 细进度条。 */
+    /** 悬浮卡紧凑行：名称 / 剩余 % / 估算 / ⏱ 重置倒计时 / 细进度条。 */
     function MiniQuotaRow(props) {
       const w = props.window
       const remaining = w?.remainingPct ?? null
       const color = remainingColor(remaining)
+      const eta = etaView(w)
       return h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
         h('span', { key: 'n', style: { width: 46, flexShrink: 0, fontSize: 10, color: T.secondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.shortLabel ?? w?.label ?? '—'),
         h(
@@ -547,9 +655,13 @@ window.__ModuleLoader__.load({
             ? null
             : h('div', { style: { height: '100%', width: `${clampPct(remaining)}%`, background: color, borderRadius: 2 } }),
         ),
-        h('span', { key: 'v', style: { minWidth: 30, textAlign: 'right', fontSize: 10, fontWeight: 600, color, fontVariantNumeric: 'tabular-nums' } }, remaining === null ? '—' : pctText(remaining)),
+        h('span', { key: 'v', style: { minWidth: 30, flexShrink: 0, textAlign: 'right', fontSize: 10, fontWeight: 600, color, fontVariantNumeric: 'tabular-nums' } }, remaining === null ? '—' : pctText(remaining)),
+        // 与面板行同一套估算：可收缩 ellipsis，数值与倒计时保持 flexShrink:0 不被挤掉。
+        eta
+          ? h('span', { key: 'e', title: eta.title, style: { flexShrink: 1, minWidth: 0, fontSize: 10, color: eta.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, eta.text)
+          : null,
         // 倒计时用 ⏱ 区分刷新动作的 ↻，避免两个图标同义混淆。
-        h('span', { key: 'r', style: { minWidth: 34, textAlign: 'right', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } }, w?.resetAt ? `⏱ ${timeUntil(w.resetAt)}` : ''),
+        h('span', { key: 'r', style: { minWidth: 34, flexShrink: 0, textAlign: 'right', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } }, w?.resetAt ? `⏱ ${timeUntil(w.resetAt)}` : ''),
       ])
     }
 
@@ -608,12 +720,17 @@ window.__ModuleLoader__.load({
       const remaining = w?.remainingPct ?? null
       const color = remainingColor(remaining)
       const band = remainingBand(remaining)
+      const eta = etaView(w)
       const statusText = w?.status && w.status !== 'ok' ? w.status : null
       const detail = remaining === null ? '数据不可用' : `已用 ${pctText(used)} · 剩余 ${pctText(remaining)}`
       return h('div', { style: { marginBottom: 12 } }, [
         h('div', { key: 'meta', style: { display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 11, marginBottom: 4, fontVariantNumeric: 'tabular-nums' } }, [
-          h('span', { key: 'l', style: { color: T.label, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.label ?? '—'),
+          h('span', { key: 'l', style: { color: T.label, fontWeight: 500, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.label ?? '—'),
           h('span', { key: 'r', title: detail, style: { marginLeft: 'auto', color, fontWeight: 600, flexShrink: 0 } }, remaining === null ? '剩余 —' : `剩余 ${pctText(remaining)}`),
+          // 估算放同一行、不换行不增高；可收缩并用 ellipsis，剩余与倒计时都是 flexShrink:0，绝不会被挤掉。
+          eta
+            ? h('span', { key: 'eta', title: eta.title, style: { flexShrink: 1, minWidth: 0, fontSize: 10, color: eta.color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, eta.text)
+            : null,
           // 低额度除颜色外再给文字标记：色觉障碍与灰度截图里也能看出档位。
           band
             ? h(
@@ -998,6 +1115,8 @@ window.__ModuleLoader__.load({
 
     exports.apply = apply
     exports.inject = ['slots']
+    // 仅供测试与诊断：估算/采样是纯函数 + 模块内状态，导出以便做真实单元测试（宿主侧不消费）。
+    exports.__internal = { estimateEta, recordSamples, getSamples, resetEtaSamples, fmtEtaDuration, etaView }
     return module.exports
   },
 })

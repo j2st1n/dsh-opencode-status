@@ -1001,11 +1001,13 @@ test('手动刷新推进请求序号，更早的在途 GET 响应不再覆盖状
   const refresh = text.slice(text.indexOf('let statusInFlight'), text.indexOf('async function refreshConfig'))
   assert.match(refresh, /const epoch = statusEpoch/)
   // 成功与失败两条路径都只接受最新 epoch 的响应
-  assert.match(refresh, /if \(epoch === statusEpoch\) store\.set\(\{ status, error: null \}\)/)
+  assert.match(refresh, /if \(epoch === statusEpoch\) \{[\s\S]{0,160}recordSamples\(status\)[\s\S]{0,160}store\.set\(\{ status, error: null \}\)/)
   assert.match(refresh, /if \(epoch === statusEpoch\) store\.set\(\{ error:/)
   // 手动刷新发起时先推进序号，自身响应仍直接落库
   const manual = text.slice(text.indexOf('async function manualRefresh'), text.indexOf('function openOverlay'))
   assert.match(manual, /statusEpoch \+= 1[\s\S]{0,240}api\('\/api\/opencode-status\/sync'/)
+  // 手动刷新同样先采样再落库，估算才能用到最新一次样本
+  assert.match(manual, /recordSamples\(status\)[\s\S]{0,80}store\.set\(\{ status, error: null \}\)/)
   assert.match(manual, /store\.set\(\{ status, error: null \}\)/)
   // 30s 轮询行为保持不变
   assert.match(text, /setInterval\(\(\) => refreshStatus\(\), 30_000\)/)
@@ -1366,4 +1368,322 @@ test('真实浏览器形态经 loopback、localhost、bind 地址与 trustedHost
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+// ---------- 消耗速率估算（t10）：纯函数 + 采样状态，全部用真实运行时断言 ----------
+
+/** 加载 client.js 到 vm 沙箱，返回插件导出（含 __internal 中的估算/采样函数）。 */
+function loadClientForUnit() {
+  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity).filter((c) => c != null) }),
+    useEffect: () => {},
+    useState: (value) => [value, () => {}],
+    useRef: (value) => ({ current: value }),
+    useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
+  }
+  let plugin = null
+  const sandbox = {
+    window: {
+      __ModuleLoader__: {
+        load: (definition) => {
+          plugin = definition.factory((name) => {
+            if (name === 'react') return React
+            throw new Error(`unexpected require: ${name}`)
+          })
+        },
+      },
+    },
+    document: { createElement: () => ({ remove() {} }), head: { appendChild() {} } },
+    fetch: async () => ({ ok: true, json: async () => ({}) }),
+    setInterval: () => 0,
+    clearInterval: () => {},
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+  }
+  vm.createContext(sandbox)
+  vm.runInContext(source, sandbox, { filename: 'client.js' })
+  return plugin
+}
+
+/** 用「注入的 state」渲染面板或 footer（hover 强制打开），并保留元素树用于 props/样式断言。 */
+function renderClientTree({ state, forceHover = false }) {
+  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity).filter((c) => c != null) }),
+    // OverlayPanel 用 useState('closed') 初始化相位；footer 的 hovering 用 false 初始化，这里按需放行。
+    useEffect: () => {},
+    useState: (value) => [value === 'closed' ? 'open' : forceHover && value === false ? true : value, () => {}],
+    useRef: (value) => ({ current: value }),
+    useSyncExternalStore: () => state,
+  }
+  let plugin = null
+  const registered = []
+  const sandbox = {
+    window: {
+      __ModuleLoader__: {
+        load: (definition) => {
+          plugin = definition.factory((name) => {
+            if (name === 'react') return React
+            throw new Error(`unexpected require: ${name}`)
+          })
+        },
+      },
+    },
+    document: { createElement: () => ({ remove() {} }), head: { appendChild() {} } },
+    fetch: async () => ({ ok: true, json: async () => ({}) }),
+    setInterval: () => 0,
+    clearInterval: () => {},
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+  }
+  vm.createContext(sandbox)
+  vm.runInContext(source, sandbox, { filename: 'client.js' })
+  plugin.apply({
+    effect: (factory) => factory(),
+    slots: {
+      inject: (name, factory) => factory(),
+      register: (meta, component) => {
+        registered.push(component)
+        return () => {}
+      },
+    },
+  })
+  return { plugin, footer: registered[0], panel: registered[1] }
+}
+
+const collectNodeText = (node, out = []) => {
+  if (node == null || node === false) return out
+  if (typeof node === 'string' || typeof node === 'number') {
+    out.push(String(node))
+    return out
+  }
+  if (Array.isArray(node)) {
+    node.forEach((n) => collectNodeText(n, out))
+    return out
+  }
+  if (typeof node.type === 'function') {
+    collectNodeText(node.type(node.props), out)
+    return out
+  }
+  for (const key of ['aria-valuetext', 'title']) {
+    if (typeof node.props?.[key] === 'string') out.push(node.props[key])
+  }
+  node.children.forEach((n) => collectNodeText(n, out))
+  return out
+}
+
+const findNode = (node, predicate) => {
+  if (node == null || node === false) return null
+  if (typeof node === 'string' || typeof node === 'number') return null
+  if (Array.isArray(node)) {
+    for (const n of node) {
+      const hit = findNode(n, predicate)
+      if (hit) return hit
+    }
+    return null
+  }
+  if (typeof node.type === 'function') return findNode(node.type(node.props), predicate)
+  const ownText = collectNodeText(node.children).join('')
+  if (predicate(ownText, node)) return node
+  for (const n of node.children) {
+    const hit = findNode(n, predicate)
+    if (hit) return hit
+  }
+  return null
+}
+
+test('估算纯函数：样本不足/跨度不足/速率为 0/回落/缺 resetAt 一律返回 null', () => {
+  const { estimateEta } = loadClientForUnit().__internal
+  const now = 1_700_000_000_000
+  const min = 60_000
+  const mk = (at, used) => ({ at, used })
+
+  // 样本不足（<3）
+  assert.equal(estimateEta([mk(now - 20 * min, 0), mk(now, 10)], 20, now + 60 * min, now), null)
+  // 跨度不足（3 个样本但只跨 5 分钟）
+  assert.equal(estimateEta([mk(now - 5 * min, 0), mk(now - 2 * min, 2), mk(now, 5)], 20, now + 60 * min, now), null)
+  // 速率为 0（used 不变）
+  assert.equal(estimateEta([mk(now - 20 * min, 10), mk(now - 10 * min, 10), mk(now, 10)], 20, now + 60 * min, now), null)
+  // used 回落（异常数据）不得算出正 ETA
+  assert.equal(estimateEta([mk(now - 20 * min, 10), mk(now - 10 * min, 8), mk(now, 6)], 20, now + 60 * min, now), null)
+  // resetAt 缺失或已过期：无法判断能否撑到重置
+  assert.equal(estimateEta([mk(now - 20 * min, 0), mk(now - 10 * min, 4), mk(now, 8)], 20, null, now), null)
+  assert.equal(estimateEta([mk(now - 20 * min, 0), mk(now - 10 * min, 4), mk(now, 8)], 20, now - min, now), null)
+  // 剩余为 0 时不再给「后耗尽」的荒谬文案
+  assert.equal(estimateEta([mk(now - 20 * min, 0), mk(now - 10 * min, 4), mk(now, 8)], 0, now + 60 * min, now), null)
+})
+
+test('估算纯函数：ETA 短于重置标记耗尽，长于重置标记可支撑，时长文案分级', () => {
+  const { estimateEta, fmtEtaDuration } = loadClientForUnit().__internal
+  const now = 1_700_000_000_000
+  const min = 60_000
+  // 20 分钟用掉 10% → 0.5%/min；剩余 20% → 40 分钟后耗尽
+  const samples = [{ at: now - 20 * min, used: 0 }, { at: now - 10 * min, used: 5 }, { at: now, used: 10 }]
+  const short = estimateEta(samples, 20, now + 60 * min, now)
+  assert.equal(Math.round(short.etaMs / min), 40)
+  assert.equal(short.exhaustsBeforeReset, true)
+  // 同样速率下剩余 80% → 160 分钟，长于 60 分钟后的重置
+  const long = estimateEta(samples, 80, now + 60 * min, now)
+  assert.equal(long.exhaustsBeforeReset, false)
+  assert.equal(Math.round(long.untilResetMs / min), 60)
+  // 时长文案：<1h 分钟、<24h h+m、更长 d+h
+  assert.equal(fmtEtaDuration(40 * min), '40m')
+  assert.equal(fmtEtaDuration(125 * min), '2h5m')
+  assert.equal(fmtEtaDuration(26 * 60 * min), '1d2h')
+})
+
+test('采样：按 fetchedAt 去重、按窗口分组，used 回落或 resetsAt 变化清空该窗口历史', () => {
+  const { recordSamples, getSamples, resetEtaSamples } = loadClientForUnit().__internal
+  resetEtaSamples()
+  const t0 = 1_700_000_000_000
+  const resetAt = t0 + 86_400_000
+  const status = (at, rollingUsed, weeklyUsed, nextResetAt = resetAt) => ({
+    ok: true,
+    mode: 'ready',
+    fetchedAt: at,
+    windows: [
+      { id: 'rolling', usedPct: rollingUsed, remainingPct: 100 - rollingUsed, resetAt: nextResetAt },
+      { id: 'weekly', usedPct: weeklyUsed, remainingPct: 100 - weeklyUsed, resetAt },
+    ],
+  })
+
+  // 同一 fetchedAt（宿主 30s 缓存）只留一个样本
+  recordSamples(status(t0, 10, 0))
+  recordSamples(status(t0, 10, 0))
+  assert.equal(getSamples('rolling').length, 1)
+  // 不同 fetchedAt 正常追加
+  recordSamples(status(t0 + 60_000, 12, 1))
+  // 跨 realm 对象/数组原型不同，deepStrictEqual 会报「同结构非同一引用」，这里投影成基元再比。
+  const pairs = (id) => Array.from(getSamples(id), (s) => [s.at, s.used])
+  assert.deepEqual(pairs('rolling'), [[t0, 10], [t0 + 60_000, 12]])
+  // used 回落 → 该窗口历史清空，只保留重置后的新样本；其他窗口不受影响
+  recordSamples(status(t0 + 120_000, 3, 2))
+  assert.deepEqual(pairs('rolling'), [[t0 + 120_000, 3]])
+  assert.equal(getSamples('weekly').length, 3)
+  // resetsAt 变化（即使 used 继续增长）→ 同样清空该窗口历史
+  recordSamples(status(t0 + 180_000, 4, 3, resetAt + 86_400_000))
+  assert.deepEqual(pairs('rolling'), [[t0 + 180_000, 4]])
+  // weekly 的 resetsAt 没变，历史继续累积（不受 rolling 重置影响）
+  assert.equal(getSamples('weekly').length, 4)
+  // 失败状态（ok:false / 无 fetchedAt）不采样
+  recordSamples({ ok: false, fetchedAt: t0 + 240_000, windows: [] })
+  recordSamples({ ok: true, windows: [] })
+  assert.equal(getSamples('rolling').length, 1)
+  // 未成功过的窗口读取为空
+  assert.equal(getSamples('monthly').length, 0)
+})
+
+test('采样裁剪：每窗口最多 120 个样本，且只保留最近 60 分钟', () => {
+  const { recordSamples, getSamples, resetEtaSamples } = loadClientForUnit().__internal
+  resetEtaSamples()
+  const t0 = 1_700_000_000_000
+  const resetAt = t0 + 86_400_000
+  const push = (at, used) => recordSamples({
+    ok: true,
+    fetchedAt: at,
+    windows: [{ id: 'rolling', usedPct: used, remainingPct: 100 - used, resetAt }],
+  })
+
+  // 130 个 10 秒间隔样本，总跨度 21.5 分钟（全部在 60 分钟内）→ 只保留最近 120 个
+  for (let i = 0; i < 130; i += 1) push(t0 + i * 10_000, i)
+  const capped = getSamples('rolling')
+  assert.equal(capped.length, 120)
+  assert.equal(capped[0].used, 10)
+  assert.equal(capped[capped.length - 1].used, 129)
+
+  // 3 小时后追加：cutoff 之前的旧样本全部裁掉，只剩新样本
+  push(t0 + 3 * 3_600_000, 200)
+  const pruned = getSamples('rolling')
+  assert.equal(pruned.length, 1)
+  assert.equal(pruned[0].used, 200)
+})
+
+test('三态渲染：可估算才渲染（面板与悬浮卡同一文案），不可估算不渲染任何节点', () => {
+  const now = Date.now()
+  const min = 60_000
+  const resetAt = now + 2 * 3_600_000
+  const history = [
+    { at: now - 24 * min, used: 0 },
+    { at: now - 12 * min, used: 5 },
+    { at: now - min, used: 10 },
+  ]
+  const currentStatus = {
+    ok: true,
+    mode: 'ready',
+    fetchedAt: now - min,
+    config: { baseUrl: 'https://opencode.ai/zen/go' },
+    windows: [{ id: 'rolling', label: '滚动窗口 (5h)', shortLabel: '5h', usedPct: 10, remainingPct: 20, status: 'ok', resetAt }],
+  }
+  const stateFor = (status) => ({ open: true, view: 'status', status, config: { baseUrl: 'https://opencode.ai/zen/go' }, refreshing: false, error: null })
+  const inject = (plugin) => {
+    for (const sample of history) {
+      plugin.__internal.recordSamples({
+        ok: true,
+        fetchedAt: sample.at,
+        windows: [{ id: 'rolling', usedPct: sample.used, remainingPct: 100 - sample.used, resetAt }],
+      })
+    }
+  }
+
+  // 1) ETA < 距重置（剩余 20% → 约 46m，重置还有 2h）→ 告警色「约 46m 后耗尽」
+  const shortCase = renderClientTree({ state: stateFor(currentStatus) })
+  inject(shortCase.plugin)
+  const panelTree = shortCase.panel()
+  const panelText = collectNodeText(panelTree).join('|')
+  assert.match(panelText, /约 46m 后耗尽/)
+  assert.match(panelText, /按最近 23 分钟的消耗速率估算（按当前速率），仅供参考/)
+  const exhausted = findNode(panelTree, (text) => text === '约 46m 后耗尽')
+  assert.ok(exhausted, '应渲染耗尽估算节点')
+  assert.equal(exhausted.type, 'span')
+  assert.equal(exhausted.props.style.color, 'var(--dsw-alias-state-warn-primary)')
+  // 布局：不换行、可收缩 ellipsis、不占额外行高
+  assert.equal(exhausted.props.style.flexShrink, 1)
+  assert.equal(exhausted.props.style.minWidth, 0)
+  assert.equal(exhausted.props.style.whiteSpace, 'nowrap')
+  assert.equal(exhausted.props.style.overflow, 'hidden')
+  assert.equal(exhausted.props.style.margin, undefined)
+  // 「剩余 N%」与「⏱ 倒计时」硬性保留
+  const remainingNode = findNode(panelTree, (text) => text === '剩余 20%')
+  const countdownNode = findNode(panelTree, (text) => text.startsWith('⏱ '))
+  assert.ok(remainingNode && countdownNode, '剩余与倒计时必须同屏')
+  assert.equal(remainingNode.props.style.flexShrink, 0)
+  assert.equal(countdownNode.props.style.flexShrink, 0)
+  // 同一行（flex 且未换行）
+  const metaRow = findNode(panelTree, (text, node) => node.props?.style?.display === 'flex' && text.includes('剩余 20%') && text.includes('后耗尽'))
+  assert.ok(metaRow, '估算与剩余应在同一条 flex 行内')
+  assert.equal(metaRow.props.style.flexWrap, undefined)
+  // 诚实性：估算文案不出现预测口吻（「即将耗尽」是既有档位标记，单独存在，不算预测）
+  assert.doesNotMatch(panelText, /预计|将要|将会/)
+
+  // 2) 同一速率、剩余 80%（约 184m > 120m）→ 中性色「可支撑到重置」
+  const supportStatus = { ...currentStatus, windows: [{ ...currentStatus.windows[0], usedPct: 10, remainingPct: 80 }] }
+  const supportCase = renderClientTree({ state: stateFor(supportStatus) })
+  inject(supportCase.plugin)
+  const supportTree = supportCase.panel()
+  const supportText = collectNodeText(supportTree).join('|')
+  assert.match(supportText, /可支撑到重置/)
+  assert.doesNotMatch(supportText, /后耗尽/)
+  const supportNode = findNode(supportTree, (text) => text === '可支撑到重置')
+  assert.equal(supportNode.props.style.color, 'var(--dsw-alias-label-secondary)')
+
+  // 3) 不可估算（没有任何样本）→ 完全不渲染估算节点，也不出现占位文案
+  const emptyCase = renderClientTree({ state: stateFor(currentStatus) })
+  const emptyTree = emptyCase.panel()
+  const emptyText = collectNodeText(emptyTree).join('|')
+  assert.doesNotMatch(emptyText, /后耗尽|可支撑到重置|估算/)
+  assert.equal(findNode(emptyTree, (text) => text === '剩余 20%')?.props?.style?.flexShrink, 0)
+  // 不留下 "--"/"0m"/"估算中" 之类占位
+  assert.equal(findNode(emptyTree, (text) => /^(-{2,}|0m|估算中|--)$/.test(text)), null)
+
+  // 4) 悬浮微卡走同一套估算：文案与面板完全一致（两条渲染路径不漂移）
+  const hoverCase = renderClientTree({ state: { ...stateFor(currentStatus), open: false }, forceHover: true })
+  inject(hoverCase.plugin)
+  const hoverText = collectNodeText(hoverCase.footer({ wide: true })).join('|')
+  assert.match(hoverText, /约 46m 后耗尽/)
+  assert.match(hoverText, /按最近 23 分钟的消耗速率估算（按当前速率），仅供参考/)
+  // 卡片仍是 aria-hidden 的只读微卡：同一份估算不在读屏里重复播报
+  const hoverTree = hoverCase.footer({ wide: true })
+  const hoverCard = findNode(hoverTree, (text, node) => node.props?.['aria-hidden'] === true)
+  assert.ok(hoverCard, '悬浮卡应为 aria-hidden')
 })
