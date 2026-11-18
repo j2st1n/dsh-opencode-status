@@ -1626,14 +1626,14 @@ test('三态渲染：面板可估算才渲染（悬浮卡紧凑视图不展示�
     }
   }
 
-  // 1) ETA < 距重置（剩余 20% → 约 46m，重置还有 2h）→ 告警色「约 46m 后耗尽」
+  // 1) ETA < 距重置（剩余 20% → 约 46m，粗化后 45m，重置还有 2h）→ 告警色「约 45m 后耗尽」
   const shortCase = renderClientTree({ state: stateFor(currentStatus) })
   inject(shortCase.plugin)
   const panelTree = shortCase.panel()
   const panelText = collectNodeText(panelTree).join('|')
-  assert.match(panelText, /约 46m 后耗尽/)
+  assert.match(panelText, /约 45m 后耗尽/)
   assert.match(panelText, /按最近 23 分钟的消耗速率估算（按当前速率），仅供参考/)
-  const exhausted = findNode(panelTree, (text) => text === '约 46m 后耗尽')
+  const exhausted = findNode(panelTree, (text) => text === '约 45m 后耗尽')
   assert.ok(exhausted, '应渲染耗尽估算节点')
   assert.equal(exhausted.type, 'span')
   assert.equal(exhausted.props.style.color, 'var(--dsw-alias-state-warn-primary)')
@@ -1650,7 +1650,7 @@ test('三态渲染：面板可估算才渲染（悬浮卡紧凑视图不展示�
   assert.equal(remainingNode.props.style.flexShrink, 0)
   assert.equal(countdownNode.props.style.flexShrink, 0)
   // 同一行（flex 且未换行）
-  const metaRow = findNode(panelTree, (text, node) => node.props?.style?.display === 'flex' && text.includes('剩余 20%') && text.includes('约 46m 后耗尽'))
+  const metaRow = findNode(panelTree, (text, node) => node.props?.style?.display === 'flex' && text.includes('剩余 20%') && text.includes('约 45m 后耗尽'))
   assert.ok(metaRow, '估算与剩余应在同一条 flex 行内')
   assert.equal(metaRow.props.style.flexWrap, undefined)
   // 只有窗口标签允许 ellipsis；档位/剩余/ETA/倒计时都不截断
@@ -1737,4 +1737,22 @@ test('三态渲染：面板可估算才渲染（悬浮卡紧凑视图不展示�
   // 卡片仍是 aria-hidden 的只读微卡
   const hoverCard = findNode(hoverTree, (text, node) => node.props?.['aria-hidden'] === true)
   assert.ok(hoverCard, '悬浮卡应为 aria-hidden')
+})
+
+test('ETA 粗化：按两位有效数字取整，不暗示分钟级精度', () => {
+  const { plugin } = renderClientTree({
+    state: { open: false, view: 'status', status: null, config: null, refreshing: false, error: null },
+  })
+  const { coarsenEta } = plugin.__internal
+  const m = 60_000
+  // <1h：取 5 分钟，且最小 5m（避免出现「约 0m」）
+  assert.equal(coarsenEta(3 * m), 5 * m)
+  assert.equal(coarsenEta(46 * m), 45 * m)
+  assert.equal(coarsenEta(59 * m), 60 * m)
+  // 1-10h：取 30 分钟（1h54m → 2h）
+  assert.equal(coarsenEta(114 * m), 120 * m)
+  // ≥10h：取 1 小时（13h10m → 13h）
+  assert.equal(coarsenEta(790 * m), 780 * m)
+  // ≥48h：取 1 天（82h → 3d）
+  assert.equal(coarsenEta(82 * 60 * m), 72 * 60 * m)
 })

@@ -245,6 +245,20 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 估算值粗化：上游只给整数 percent，量化误差会让 ETA 的真实区间比点值宽 2-3 倍，
+     * 分钟级精度属于虚假精确。按「两位有效数字」粗化，既保留量级又不再暗示精度：
+     *   <1h 取 5 分钟、1-10h 取 30 分钟、≥10h 取 1 小时、≥48h 取 1 天。
+     */
+    function coarsenEta(ms) {
+      const minutes = ms / 60_000
+      if (minutes < 60) return Math.max(5, Math.round(minutes / 5) * 5) * 60_000
+      if (minutes < 600) return Math.round(minutes / 30) * 30 * 60_000
+      const hours = minutes / 60
+      if (hours < 48) return Math.round(hours) * 3_600_000
+      return Math.round(hours / 24) * 86_400_000
+    }
+
+    /**
      * 估算文案的三态：不可估算返回 null（调用方完全不渲染节点，不显示 "--"/"估算中" 之类占位）；
      * 撑不到重置用告警色「约 X 后耗尽」，撑得到用中性色「可支撑到重置」。
      * 文案只用「按当前速率」的描述，不用「预计/将」这种预测口吻。
@@ -265,7 +279,7 @@ window.__ModuleLoader__.load({
       const title = `按最近 ${minutes} 分钟的消耗速率估算（按当前速率），仅供参考`
       // 保留完整字面「约 X 后耗尽」：真实 Chrome 实测在 326px/262px 内容宽下都不会截断，只会让标签多收缩。
       return estimate.exhaustsBeforeReset
-        ? { text: `约 ${fmtEtaDuration(estimate.etaMs)} 后耗尽`, color: T.warn, title }
+        ? { text: `约 ${fmtEtaDuration(coarsenEta(estimate.etaMs))} 后耗尽`, color: T.warn, title }
         : { text: '可支撑到重置', color: T.secondary, title }
     }
 
@@ -433,6 +447,9 @@ window.__ModuleLoader__.load({
           if (canListen) document.removeEventListener('visibilitychange', onVisibilityChange)
         }
       }, [])
+
+      // 卸载时清掉待触发的悬停定时器，避免 220ms 后对已卸载组件 setState。
+      useEffect(() => () => clearTimeout(hoverTimerRef.current), [])
 
       const onMouseEnter = () => {
         clearTimeout(hoverTimerRef.current)
@@ -935,6 +952,7 @@ window.__ModuleLoader__.load({
           h(
             'button',
             {
+              key: 'refresh',
               className: 'oc-btn',
               style: btnBase,
               disabled: state.refreshing,
@@ -1126,7 +1144,7 @@ window.__ModuleLoader__.load({
     exports.apply = apply
     exports.inject = ['slots']
     // 仅供测试与诊断：估算/采样是纯函数 + 模块内状态，导出以便做真实单元测试（宿主侧不消费）。
-    exports.__internal = { estimateEta, recordSamples, getSamples, resetEtaSamples, fmtEtaDuration, etaView }
+    exports.__internal = { estimateEta, recordSamples, getSamples, resetEtaSamples, fmtEtaDuration, coarsenEta, etaView }
     return module.exports
   },
 })
