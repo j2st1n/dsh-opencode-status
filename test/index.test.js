@@ -732,12 +732,18 @@ test('面板可 Esc 关闭、具备 dialog 语义与焦点归还，进度条暴�
   assert.match(panel, /role: 'dialog'/)
   assert.match(panel, /'aria-label': settingsView \? 'OpenCode GO 连接配置' : 'OpenCode GO 用量'/)
   assert.doesNotMatch(panel, /'aria-modal'/)
-  // 打开时焦点移入面板（容器 tabIndex=-1），关闭时归还触发元素
+  // 打开时焦点移入面板（容器 tabIndex=-1），关闭时归还触发元素。
+  // 运行时复现由 /tmp/verify-focus.mjs 手工验证（真实 React 18.3.1 + jsdom），CI 无 jsdom 依赖，这里只固化关键结构：
+  // deps 必须同时包含 state.open 与 phase，且 phase 未到 'open' 时早退——否则面板 DOM 尚未挂载时
+  // panelRef.current 为 null，panel.focus() 静默失效。
+  assert.match(panel, /\}, \[state\.open, phase\]\)/)
+  assert.match(panel, /if \(!state\.open \|\| phase !== 'open'\) return/)
   assert.match(panel, /tabIndex: -1/)
   assert.match(panel, /if \(panel && typeof panel\.focus === 'function'\) panel\.focus\(\)/)
   assert.match(panel, /previous\.focus\(\)/)
-  // 点击外部关闭时不抢走用户刚点中的控件焦点
-  assert.match(panel, /panel\.contains\(active\)/)
+  // 点击外部关闭时不抢走用户刚点中的控件焦点；cleanup 用当前 panelRef.current 判断（打开时捕获的 panel 可能为 null）
+  assert.match(panel, /const current = panelRef\.current/)
+  assert.match(panel, /current\.contains\(active\)/)
   // Tab 在面板内首尾循环，不立即逃到背后的不可见区域
   assert.match(panel, /e\.key !== 'Tab'/)
   assert.match(panel, /FOCUSABLE/)
@@ -835,6 +841,15 @@ test('上游小数与越界百分比被取整并钳制到 0–100（P0）', asyn
     assert.equal(rounded.body.windows[0].usedPct, 13)
     assert.equal(rounded.body.windows[0].remainingPct, 87)
     assert.equal(rounded.body.monthlyUsedPct, 13)
+
+    // x.5 边界：先取整 used 再用 100 - used 派生 remaining，两者之和必须恒为 100（旧实现 12.5→13/88）
+    globalThis.fetch = async () => usage(12.5)
+    const half = await invoke(route, 'GET', '/api/opencode-status?force=1')
+    assert.equal(half.body.windows[0].usedPct, 13)
+    assert.equal(half.body.windows[0].remainingPct, 87)
+    for (const w of half.body.windows) {
+      assert.equal(w.usedPct + w.remainingPct, 100)
+    }
 
     globalThis.fetch = async () => usage(150)
     const over = await invoke(route, 'GET', '/api/opencode-status?force=1')

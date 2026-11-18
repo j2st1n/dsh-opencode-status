@@ -533,7 +533,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** 悬浮卡紧凑行：名称 / 剩余 % / ↻ 重置倒计时 / 细进度条。 */
+    /** 悬浮卡紧凑行：名称 / 剩余 % / ⏱ 重置倒计时 / 细进度条。 */
     function MiniQuotaRow(props) {
       const w = props.window
       const remaining = w?.remainingPct ?? null
@@ -892,9 +892,11 @@ window.__ModuleLoader__.load({
         return () => window.removeEventListener('keydown', handleKeyDown)
       }, [state.open])
 
-      // 焦点管理：打开时移入面板（容器 tabIndex=-1），关闭时归还打开前的触发元素（footer 按钮）。
+      // 焦点管理：面板挂载（phase 进入 open）后把焦点移入面板（容器 tabIndex=-1），关闭时归还打开前的触发元素（footer 按钮）。
+      // 依赖必须带上 phase：面板 DOM 要等 phase effect 把 phase 推到 'open' 才挂载，只依赖 state.open 时
+      // 首次执行 panelRef.current 还是 null，panel.focus() 会静默失效（运行时复现由 /tmp/verify-focus.mjs 手工验证，CI 无 jsdom 依赖）。
       useEffect(() => {
-        if (!state.open) return
+        if (!state.open || phase !== 'open') return
         if (typeof document === 'undefined') return
         const previous = document.activeElement
         const panel = panelRef.current
@@ -902,11 +904,13 @@ window.__ModuleLoader__.load({
         return () => {
           if (!previous || typeof previous.focus !== 'function') return
           // 只把焦点从面板（或已失焦的 body）收回触发按钮：点击外部关闭时不要抢走用户刚点中的控件焦点。
+          // cleanup 里不能用打开时捕获的 panel（闭包可能拿到 null），改用当前 ref。
+          const current = panelRef.current
           const active = document.activeElement
-          if (active && active !== document.body && typeof panel?.contains === 'function' && !panel.contains(active)) return
+          if (active && active !== document.body && typeof current?.contains === 'function' && !current.contains(active)) return
           previous.focus()
         }
-      }, [state.open])
+      }, [state.open, phase])
 
       if (phase === 'closed') return null
 
