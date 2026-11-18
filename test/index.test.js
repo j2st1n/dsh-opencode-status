@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { Readable } from 'node:stream'
 import test from 'node:test'
+import vm from 'node:vm'
 
 import { apply, Config, inject } from '../src/index.js'
 
@@ -633,9 +634,9 @@ test('热改 baseUrl / keyRef 后缓存立即失效，下一次 GET 重新拉取
   }
 })
 
-test('package.json 声明 DSH 0.2.x 兼容范围与 0.2.3 版本', () => {
+test('package.json 升到 0.3.0，并保留 DSH 0.2.x 兼容范围', () => {
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-  assert.equal(manifest.version, '0.2.3')
+  assert.equal(manifest.version, '0.3.0')
   assert.equal(manifest.engines.node, '>=20')
   // 上界写成 `<0.3.0-0`：0.3.0 的预发布版（0.3.0-rc.1 / rc.2）也因此 UNMET。
   // 该范围语义由宿主 app-boot 的 evaluatePluginCompatibility 验证：
@@ -643,17 +644,427 @@ test('package.json 声明 DSH 0.2.x 兼容范围与 0.2.3 版本', () => {
   assert.equal(manifest.engines.dsh, '>=0.2.0 <0.3.0-0')
 })
 
-test('配置面板的「取消」按钮有真实处理函数，不再翻转已废弃的 editing 标记', () => {
-  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
-  assert.match(text, /onClick: cancel/)
-  assert.match(text, /function cancel\(\)/)
-  assert.match(text, /store\.set\(\{ open: false \}\)/)
-  assert.doesNotMatch(text, /editing/)
+test('CHANGELOG 顶部是 0.3.0，README 描述新的点击/刷新/设置/悬浮行为', () => {
+  const changelog = readFileSync(new URL('../CHANGELOG.md', import.meta.url), 'utf8')
+  assert.match(changelog, /^# Changelog\n\n## 0\.3\.0\n/)
+  assert.match(changelog, /用量面板/)
+  assert.match(changelog, /刷新/)
+
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8')
+  assert.match(readme, /用量面板/)
+  assert.match(readme, /点击/)
+  assert.match(readme, /刷新/)
+  assert.match(readme, /设置/)
+  assert.match(readme, /悬浮/)
+  assert.match(readme, /剩余/)
 })
 
-test('client 的强制刷新请求带 application/json 内容类型', () => {
+test('客户端默认视图为用量，设置是独立视图且不再使用已废弃的 editing 标记', () => {
   const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  // store 用 view: 'status' | 'settings' 表达面板视图
+  assert.match(text, /view: 'status'/)
+  assert.match(text, /view: 'settings'/)
+  assert.doesNotMatch(text, /editing/)
+  // 点击常驻按钮 → toggleOverlay → openOverlay 重置到用量视图
+  assert.match(text, /onClick: toggleOverlay/)
+  assert.match(text, /function openOverlay\(\)[\s\S]{0,200}open: true, view: 'status'/)
+  // 设置入口独立，且未配置时直接显示设置视图
+  assert.match(text, /onClick: openSettings/)
+  assert.match(text, /store\.set\(\{ view: 'settings' \}\)/)
+  assert.match(text, /state\.view === 'settings' \|\| st\?\.mode === 'needs_config'/)
+})
+
+test('底部操作条「刷新」调用 sync 且带 JSON 内容类型，展示上次同步时间与错误文案', () => {
+  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  // 手动刷新走 POST /api/opencode-status/sync，并显式声明 JSON 内容类型
   assert.match(text, /\/api\/opencode-status\/sync'[\s\S]{0,160}content-type': 'application\/json'/)
+  assert.match(text, /method: 'POST'/)
+  assert.match(text, /onClick: manualRefresh/)
+  // 刷新期间禁用按钮并显示旋转 + 「刷新中…」
+  assert.match(text, /disabled: state\.refreshing/)
+  assert.match(text, /'刷新中…'/)
+  assert.match(text, /className: state\.refreshing \? 'oc-spin' : undefined/)
+  // 上次同步时间取 status.fetchedAt，格式 HH:MM:SS
+  assert.match(text, /const lastSync = st\?\.fetchedAt \? fmtClock\(st\.fetchedAt\) : null/)
+  assert.match(text, /上次同步 \$\{lastSync\}/)
+  assert.match(text, /pad\(d\.getHours\(\)\)/)
+  // 失败时在面板内显示错误文案，而不是静默
+  assert.match(text, /刷新失败：\$\{state\.error\}/)
+})
+
+test('设置视图可保存回用量视图、「取消」丢弃编辑并关闭面板', () => {
+  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  assert.match(text, /保存并连接/)
+  assert.match(text, /store\.set\(\{ status: result\.status, config: result\.config, view: 'status', error: null \}\)/)
+  assert.match(text, /onClick: cancel/)
+  assert.match(text, /function cancel\(\)/)
+  assert.match(text, /store\.set\(\{ open: false, view: 'status' \}\)/)
+  assert.match(text, /'← 返回用量'/)
+})
+
+test('三个窗口行同时给出已用/剩余百分比、倒计时与按剩余阈值着色的进度条', () => {
+  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  const quotaRow = text.slice(text.indexOf('function QuotaRow'), text.indexOf('// ---------- 连接设置视图'))
+  assert.match(quotaRow, /已用 \$\{used\}%/)
+  assert.match(quotaRow, /剩余 \$\{remaining\}%/)
+  assert.match(quotaRow, /timeUntil\(w\.resetAt\)/)
+  assert.match(quotaRow, /clampPct\(remaining\)/)
+  assert.match(quotaRow, /remainingColor\(remaining\)/)
+  // 窗口 status 非 ok 时有可见提示
+  assert.match(quotaRow, /窗口状态异常：/)
+  // 阈值语义：>50 正常、>20 警告、其余错误（与 cpa 的 QuotaBar 一致）
+  assert.match(text, /if \(remaining > 50\) return T\.ok/)
+  assert.match(text, /if \(remaining > 20\) return T\.warn/)
+  // 不编造金额余额，只用剩余额度/百分比表述（源码不含 $10 / ¥10 这类货币金额）
+  assert.doesNotMatch(text, /[\$¥€]\s?\d/)
+})
+
+test('侧栏按钮按月剩余着色，rail 模式渲染真正的 button 并打开用量视图', () => {
+  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  // 文案体现月剩余摘要，颜色取剩余额度阈值
+  assert.match(text, /月剩余 \$\{monthlyRemaining\}%/)
+  assert.match(text, /color = monthlyRemaining === null \? T\.warn : remainingColor\(monthlyRemaining\)/)
+  // rail 模式（wide === false）是真 button，不是 div
+  const rail = text.slice(text.indexOf('if (props?.wide === false)'), text.indexOf('const segments ='))
+  assert.match(rail, /h\(\s*'button'/)
+  assert.match(rail, /onClick: toggleOverlay/)
+  assert.doesNotMatch(rail, /h\(\s*'div'/)
+  assert.match(rail, /monthlyRemaining !== null \? `\$\{monthlyRemaining\}%` : 'GO'/)
+})
+
+test('client 工厂可在最小 React stub 下加载，注册两个槽位且 rail 模式渲染真 button', () => {
+  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    useEffect: () => {},
+    useState: (value) => [typeof value === 'function' ? value() : value, () => {}],
+    useRef: (value) => ({ current: value }),
+    useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
+  }
+  let plugin = null
+  const registered = []
+  const sandbox = {
+    window: {
+      __ModuleLoader__: {
+        load: (definition) => {
+          plugin = definition.factory((name) => {
+            if (name === 'react') return React
+            throw new Error(`unexpected require: ${name}`)
+          })
+        },
+      },
+    },
+    document: { createElement: () => ({ remove() {} }), head: { appendChild() {} } },
+    fetch: async () => ({ ok: true, json: async () => ({}) }),
+    setInterval: () => 0,
+    clearInterval: () => {},
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+  }
+  vm.createContext(sandbox)
+  vm.runInContext(source, sandbox, { filename: 'client.js' })
+
+  assert.deepEqual([...plugin.inject], ['slots'])
+  plugin.apply({
+    effect: (factory) => factory(),
+    slots: {
+      inject: (name, factory) => factory(),
+      register: (meta, component) => {
+        registered.push({ meta, component })
+        return () => {}
+      },
+    },
+  })
+  assert.deepEqual(registered.map((r) => r.meta.name), ['sidebar.footer.action', 'shell.overlay'])
+  assert.deepEqual(registered.map((r) => r.meta.id), ['opencode-status', 'opencode-status-panel'])
+
+  // rail 模式必须渲染为真正的 button，并且点击处理函数存在
+  const element = registered[0].component({ wide: false })
+  const rail = element.type(element.props)
+  assert.equal(rail.type, 'button')
+  assert.equal(typeof rail.props.onClick, 'function')
+})
+
+test('220ms 悬浮卡展示标题 + Go 标识 + 上次同步与三窗口紧凑行，且不拦截点击', () => {
+  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  const card = text.slice(text.indexOf('function HoverCard'), text.indexOf('/** 悬浮卡紧凑行'))
+  assert.match(card, /OpenCode GO 用量/)
+  assert.match(card, /'GO'/)
+  assert.match(card, /上次同步 \$\{fmtClock\(st\.fetchedAt\)\}/)
+  assert.match(card, /MiniQuotaRow/)
+  assert.match(card, /点击查看详情/)
+  // 只读卡片：没有假按钮，且不接收指针事件，不遮挡 footer 按钮
+  assert.doesNotMatch(card, /h\('button'/)
+  assert.match(card, /pointerEvents: 'none'/)
+
+  // 220ms 延迟、面板关闭且 ready+ok 时才渲染
+  assert.match(text, /setTimeout\(\(\) => setHovering\(true\), 220\)/)
+  assert.match(text, /if \(!hovering \|\| state\.open \|\| st\?\.mode !== 'ready' \|\| !st\.ok\) return node/)
+  // 保留 30 秒 GET 自动刷新；打开面板走缓存，不额外探测上游
+  assert.match(text, /setInterval\(\(\) => refreshStatus\(\), 30_000\)/)
+  assert.match(text, /GET 命中 30 秒缓存，不触发额外上游探测/)
+})
+
+test('手动刷新推进请求序号，更早的在途 GET 响应不再覆盖状态（F2）', () => {
+  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  // 模块级请求序号
+  assert.match(text, /let statusEpoch = 0/)
+  const refresh = text.slice(text.indexOf('let statusInFlight'), text.indexOf('async function refreshConfig'))
+  assert.match(refresh, /const epoch = statusEpoch/)
+  // 成功与失败两条路径都只接受最新 epoch 的响应
+  assert.match(refresh, /if \(epoch === statusEpoch\) store\.set\(\{ status, error: null \}\)/)
+  assert.match(refresh, /if \(epoch === statusEpoch\) store\.set\(\{ error:/)
+  // 手动刷新发起时先推进序号，自身响应仍直接落库
+  const manual = text.slice(text.indexOf('async function manualRefresh'), text.indexOf('function openOverlay'))
+  assert.match(manual, /statusEpoch \+= 1[\s\S]{0,240}api\('\/api\/opencode-status\/sync'/)
+  assert.match(manual, /store\.set\(\{ status, error: null \}\)/)
+  // 30s 轮询行为保持不变
+  assert.match(text, /setInterval\(\(\) => refreshStatus\(\), 30_000\)/)
+})
+
+test('运行时验证：手动刷新后更早的 GET 成功/失败响应都被丢弃（F2）', async () => {
+  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+
+  const createRuntime = () => {
+    const calls = []
+    const fetchImpl = (url, init) => {
+      let resolve
+      let reject
+      const promise = new Promise((res, rej) => {
+        resolve = res
+        reject = rej
+      })
+      calls.push({ url: String(url), method: init?.method ?? 'GET', headers: init?.headers ?? null, resolve, reject })
+      return promise
+    }
+    const React = {
+      createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity).filter((c) => c != null) }),
+      // 立即执行 effect 模拟挂载；OverlayPanel 的 'closed' 相位放行到 'open'。
+      useEffect: (fn) => fn(),
+      useState: (value) => [value === 'closed' ? 'open' : value, () => {}],
+      useRef: (value) => ({ current: value }),
+      useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
+    }
+    let plugin = null
+    const registered = []
+    const sandbox = {
+      window: {
+        __ModuleLoader__: {
+          load: (definition) => {
+            plugin = definition.factory((name) => {
+              if (name === 'react') return React
+              throw new Error(`unexpected require: ${name}`)
+            })
+          },
+        },
+      },
+      document: { createElement: () => ({ remove() {} }), head: { appendChild() {} } },
+      fetch: fetchImpl,
+      setInterval: () => 0,
+      clearInterval: () => {},
+      setTimeout: () => 0,
+      clearTimeout: () => {},
+    }
+    vm.createContext(sandbox)
+    vm.runInContext(source, sandbox, { filename: 'client.js' })
+    plugin.apply({
+      effect: (factory) => factory(),
+      slots: {
+        inject: (name, factory) => factory(),
+        register: (meta, component) => {
+          registered.push(component)
+          return () => {}
+        },
+      },
+    })
+    return { calls, registered }
+  }
+
+  const flush = async () => {
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve))
+  }
+
+  const collect = (node, out = []) => {
+    if (node == null || node === false) return out
+    if (typeof node === 'string' || typeof node === 'number') {
+      out.push(String(node))
+      return out
+    }
+    if (Array.isArray(node)) {
+      node.forEach((n) => collect(n, out))
+      return out
+    }
+    if (typeof node.type === 'function') {
+      collect(node.type(node.props), out)
+      return out
+    }
+    node.children.forEach((n) => collect(n, out))
+    return out
+  }
+
+  const findButton = (node, label) => {
+    if (node == null || node === false) return null
+    if (typeof node === 'string' || typeof node === 'number') return null
+    if (Array.isArray(node)) {
+      for (const n of node) {
+        const hit = findButton(n, label)
+        if (hit) return hit
+      }
+      return null
+    }
+    if (typeof node.type === 'function') return findButton(node.type(node.props), label)
+    if (node.type === 'button' && collect(node.children).join('').includes(label)) return node
+    for (const n of node.children) {
+      const hit = findButton(n, label)
+      if (hit) return hit
+    }
+    return null
+  }
+
+  const fresh = {
+    ok: true,
+    mode: 'ready',
+    fetchedAt: 2_000,
+    config: { baseUrl: 'https://fresh.example.test/go' },
+    monthlyUsedPct: 10,
+    windows: [{ id: 'monthly', label: '月窗口', shortLabel: 'Monthly', usedPct: 10, remainingPct: 90, status: 'ok', resetAt: null }],
+  }
+  const stale = {
+    ok: true,
+    mode: 'ready',
+    fetchedAt: 1_000,
+    config: { baseUrl: 'https://stale.example.test/go' },
+    monthlyUsedPct: 90,
+    windows: [{ id: 'monthly', label: '月窗口', shortLabel: 'Monthly', usedPct: 90, remainingPct: 10, status: 'ok', resetAt: null }],
+  }
+
+  // 成功路径：POST 先返回，旧 GET 后返回 → 旧数据必须被丢弃
+  const app = createRuntime()
+  collect(app.registered[0]({ wide: true })) // 挂载 footer，触发初始 GET
+  await flush()
+  const oldGet = app.calls[0]
+  assert.equal(oldGet.method, 'GET')
+  const refreshButton = findButton(app.registered[1](), '刷新')
+  assert.equal(typeof refreshButton?.props?.onClick, 'function')
+  refreshButton.props.onClick()
+  await flush()
+  const post = app.calls.find((call) => call.method === 'POST')
+  assert.equal(post.headers['content-type'], 'application/json')
+  post.resolve({ ok: true, json: async () => fresh })
+  await flush()
+  oldGet.resolve({ ok: true, json: async () => stale })
+  await flush()
+  const panelText = collect(app.registered[1]()).join('|')
+  assert.match(panelText, /月剩余 90%/)
+  assert.match(panelText, /已用 10%/)
+  assert.doesNotMatch(panelText, /月剩余 10%|已用 90%/)
+
+  // 失败路径：POST 先返回，旧 GET 随后失败 → 不能覆盖状态也不能写入错误
+  const app2 = createRuntime()
+  collect(app2.registered[0]({ wide: true }))
+  await flush()
+  const oldGet2 = app2.calls[0]
+  const refreshButton2 = findButton(app2.registered[1](), '刷新')
+  refreshButton2.props.onClick()
+  await flush()
+  app2.calls.find((call) => call.method === 'POST').resolve({ ok: true, json: async () => fresh })
+  await flush()
+  oldGet2.reject(new Error('stale GET failed'))
+  await flush()
+  const panelText2 = collect(app2.registered[1]()).join('|')
+  assert.match(panelText2, /月剩余 90%/)
+  assert.doesNotMatch(panelText2, /刷新失败/)
+})
+
+test('设置视图在 status 未加载时仍保留「← 返回用量」，仅 needs_config 隐藏（F3）', () => {
+  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+
+  const render = (state) => {
+    const React = {
+      createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity).filter((c) => c != null) }),
+      useEffect: () => {},
+      // OverlayPanel 以 'closed' 初始化 phase；这里直接放行到 'open' 渲染
+      useState: (value) => [value === 'closed' ? 'open' : value, () => {}],
+      useRef: (value) => ({ current: value }),
+      useSyncExternalStore: () => state,
+    }
+    let plugin = null
+    const registered = []
+    const sandbox = {
+      window: {
+        __ModuleLoader__: {
+          load: (definition) => {
+            plugin = definition.factory((name) => {
+              if (name === 'react') return React
+              throw new Error(`unexpected require: ${name}`)
+            })
+          },
+        },
+      },
+      document: { createElement: () => ({ remove() {} }), head: { appendChild() {} } },
+      fetch: async () => ({ ok: true, json: async () => ({}) }),
+      setInterval: () => 0,
+      clearInterval: () => {},
+      setTimeout: () => 0,
+      clearTimeout: () => {},
+    }
+    vm.createContext(sandbox)
+    vm.runInContext(source, sandbox, { filename: 'client.js' })
+    plugin.apply({
+      effect: (factory) => factory(),
+      slots: {
+        inject: (name, factory) => factory(),
+        register: (meta, component) => {
+          registered.push(component)
+          return () => {}
+        },
+      },
+    })
+
+    const texts = []
+    const walk = (node) => {
+      if (node == null || node === false) return
+      if (typeof node === 'string' || typeof node === 'number') {
+        texts.push(String(node))
+        return
+      }
+      if (Array.isArray(node)) {
+        node.forEach(walk)
+        return
+      }
+      if (typeof node.type === 'function') {
+        walk(node.type(node.props))
+        return
+      }
+      node.children.forEach(walk)
+    }
+    walk(registered[1]())
+    return texts.join('|')
+  }
+
+  // status 尚未加载（null）就切到设置视图：返回入口必须可见
+  const loading = render({ open: true, view: 'settings', status: null, config: null, refreshing: false, error: null })
+  assert.match(loading, /⚙ OpenCode GO 连接配置/)
+  assert.match(loading, /← 返回用量/)
+
+  // needs_config：没有可返回的用量数据，隐藏返回入口
+  const needsConfig = render({
+    open: true,
+    view: 'status',
+    status: {
+      ok: false,
+      mode: 'needs_config',
+      fetchedAt: 1,
+      windows: [],
+      config: { baseUrl: 'https://opencode.ai/zen/go', hasKey: false },
+      error: { code: 'NOT_CONFIGURED', message: '需要配置 OpenCode API Key' },
+    },
+    config: { baseUrl: 'https://opencode.ai/zen/go', apiKey: { configured: false, writable: true, hint: null } },
+    refreshing: false,
+    error: null,
+  })
+  assert.match(needsConfig, /⚙ OpenCode GO 连接配置/)
+  assert.doesNotMatch(needsConfig, /← 返回用量/)
 })
 
 test('写请求 Host 白名单拒绝 DNS rebinding、缺失/非法 Host 与跨站请求', async () => {

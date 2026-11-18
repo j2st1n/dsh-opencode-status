@@ -1,9 +1,12 @@
 /**
- * dsh-opencode-status — Client half.
+ * dsh-opencode-status — Client half (0.3.0).
  *
  * 槽位：
- *   sidebar.footer.action  常驻极简单行按钮（状态灯 + 月用量 %；点击呼出详情面板）
- *   shell.overlay          轻量浮层面板（展示 Rolling 5h、Weekly、Monthly 进度条与重置倒计时）
+ *   sidebar.footer.action  常驻紧凑按钮（状态灯 + 月剩余摘要；点击打开用量面板）
+ *   shell.overlay          用量面板（状态视图：三个窗口 + 固定操作条；设置视图：Base URL / API Key）
+ *
+ * 上游 /v1/usage 只提供 rolling/weekly/monthly 百分比，没有 USD 余额接口
+ * （anomalyco/opencode#10448 仍 open），界面只表述「剩余额度 / 可用百分比」，不编造金额。
  */
 window.__ModuleLoader__.load({
   id: 'dsh-opencode-status',
@@ -22,14 +25,17 @@ window.__ModuleLoader__.load({
       @keyframes ocPulse { 0% { box-shadow: 0 0 0 0 rgba(34,197,94,.45) } 70% { box-shadow: 0 0 0 5px rgba(34,197,94,0) } 100% { box-shadow: 0 0 0 0 rgba(34,197,94,0) } }
       .oc-panel-enter { animation: ocFadeSlideUp .2s cubic-bezier(.2,.9,.3,1.2) both }
       .oc-panel-exit { animation: ocFadeSlideDown .15s ease-in both; pointer-events: none !important }
-      .oc-btn { min-width: 0; transition: background .15s ease, border-color .15s ease, color .15s ease, transform .1s ease }
-      .oc-btn:hover:not(:disabled):not(.oc-btn-primary) { background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-1)); border-color: var(--dsw-alias-border-l2) }
-      .oc-btn-primary:hover:not(:disabled) { filter: brightness(1.12) }
+      .oc-btn { min-width: 0; transition: background .15s ease, border-color .15s ease, color .15s ease, transform .1s ease, opacity .15s ease }
+      .oc-btn:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-1)); border-color: var(--dsw-alias-border-l2) }
       .oc-btn:active:not(:disabled) { transform: scale(.98) }
+      .oc-btn:disabled { opacity: .55; cursor: default }
       .oc-spin { display: inline-block; animation: ocSpin .8s linear infinite }
       .oc-dot-live { animation: ocPulse 2.4s ease-out infinite }
+      /* 悬浮微卡只读：不接收任何指针事件，避免遮挡 footer 按钮的点击 */
+      .oc-hover-card { pointer-events: none !important }
       @media (prefers-reduced-motion: reduce) {
         .oc-panel-enter, .oc-panel-exit, .oc-spin, .oc-dot-live { animation: none !important }
+        .oc-btn { transition: none !important }
       }
     `
 
@@ -85,6 +91,8 @@ window.__ModuleLoader__.load({
       outline: 'none',
     }
 
+    const labelStyle = { display: 'block', fontSize: 12, color: T.secondary, marginBottom: 4 }
+
     function timeUntil(ts) {
       if (!ts) return ''
       const diff = ts - Date.now()
@@ -96,17 +104,49 @@ window.__ModuleLoader__.load({
       return `${Math.floor(hours / 24)}d${hours % 24 ? `${hours % 24}h` : ''}`
     }
 
-    function usageColor(percent) {
-      if (percent === null || percent === undefined) return T.secondary
-      if (percent >= 90) return T.err
-      if (percent >= 70) return T.warn
-      return T.ok
+    /** 同步时间显示为 HH:MM:SS（本地时区，取 status.fetchedAt）。 */
+    function fmtClock(ts) {
+      if (!ts) return ''
+      const d = new Date(ts)
+      const pad = (n) => String(n).padStart(2, '0')
+      return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+    }
+
+    /** 剩余额度阈值着色：>50 正常、>20 警告、其余错误（与 cpa 的 QuotaBar 语义一致）。 */
+    function remainingColor(remaining) {
+      if (remaining === null || remaining === undefined) return T.secondary
+      if (remaining > 50) return T.ok
+      if (remaining > 20) return T.warn
+      return T.err
+    }
+
+    function clampPct(value) {
+      return Math.max(0, Math.min(100, value))
+    }
+
+    /** 月窗口剩余百分比；上游只给百分比，不存在金额余额。 */
+    function monthlyRemainingOf(status) {
+      if (!status) return null
+      const windows = Array.isArray(status.windows) ? status.windows : []
+      const monthly = windows.find((w) => w?.id === 'monthly')
+      if (monthly && typeof monthly.remainingPct === 'number') return monthly.remainingPct
+      if (typeof status.monthlyUsedPct === 'number') return Math.max(0, 100 - status.monthlyUsedPct)
+      return null
+    }
+
+    function hostOf(url) {
+      try {
+        return new URL(url).host
+      } catch {
+        return url
+      }
     }
 
     // ---------- Store ----------
     const store = {
       state: {
         open: false,
+        view: 'status', // 'status' 用量视图 | 'settings' 连接设置视图
         status: null,
         config: null,
         refreshing: false,
@@ -127,6 +167,7 @@ window.__ModuleLoader__.load({
       return React.useSyncExternalStore(store.subscribe, () => store.state)
     }
 
+    // ---------- 本机 API ----------
     async function api(path, options) {
       const res = await fetch(path, options)
       const data = await res.json().catch(() => ({}))
@@ -134,18 +175,29 @@ window.__ModuleLoader__.load({
       return data
     }
 
-    async function refreshStatus(force = false) {
-      try {
-        const status = force
-          ? await api('/api/opencode-status/sync', {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-            })
-          : await api('/api/opencode-status')
-        store.set({ status, error: null })
-      } catch (err) {
-        store.set({ error: String(err?.message ?? err) })
-      }
+    // 请求序号：手动刷新会推进 epoch，使所有更早发出的 GET 响应（成功或失败）失效，
+    // 避免极端时序下旧数据覆盖手动刷新的新结果。
+    let statusEpoch = 0
+
+    /** GET 状态：走宿主 30 秒缓存，打开面板/切换视图都不会额外探测上游。 */
+    let statusInFlight = null
+    async function refreshStatus() {
+      // 并发去重：挂载、打开面板与 30s 轮询同时触发时只发一个 GET，避免首个请求未写入缓存前重复探测。
+      if (store.state.refreshing) return
+      if (statusInFlight) return statusInFlight
+      const epoch = statusEpoch
+      statusInFlight = (async () => {
+        try {
+          const status = await api('/api/opencode-status')
+          // 只接受最新 epoch 的响应：手动刷新之后返回的在途 GET 一律丢弃。
+          if (epoch === statusEpoch) store.set({ status, error: null })
+        } catch (err) {
+          if (epoch === statusEpoch) store.set({ error: String(err?.message ?? err) })
+        } finally {
+          statusInFlight = null
+        }
+      })()
+      return statusInFlight
     }
 
     async function refreshConfig() {
@@ -155,15 +207,56 @@ window.__ModuleLoader__.load({
       } catch {}
     }
 
-    // ---------- 常驻入口（上下结构单行按钮 + 悬停微卡） ----------
+    /** 手动刷新唯一入口：绕过 30 秒缓存，强制重新拉取当前剩余额度。 */
+    async function manualRefresh() {
+      if (store.state.refreshing) return
+      // 先推进序号：手动刷新发起后，任何更早发出的在途 GET 响应都不再落库。
+      statusEpoch += 1
+      store.set({ refreshing: true, error: null })
+      try {
+        const status = await api('/api/opencode-status/sync', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+        })
+        // 手动刷新自身的响应始终落库（刷新期间已阻止新的 GET）。
+        store.set({ status, error: null })
+      } catch (err) {
+        store.set({ error: String(err?.message ?? err) })
+      } finally {
+        store.set({ refreshing: false })
+      }
+    }
+
+    function openOverlay() {
+      store.set({ open: true, view: 'status' })
+      // 面板默认落用量视图；GET 命中 30 秒缓存，不触发额外上游探测。
+      refreshStatus()
+      refreshConfig()
+    }
+
+    function closeOverlay() {
+      store.set({ open: false })
+    }
+
+    function toggleOverlay() {
+      if (store.state.open) closeOverlay()
+      else openOverlay()
+    }
+
+    function openSettings() {
+      refreshConfig()
+      store.set({ view: 'settings' })
+    }
+
+    // ---------- 常驻入口（状态灯 + 月剩余摘要 + 220ms 悬浮微卡） ----------
     function FooterEntry(props) {
       const state = useStore()
       const [hovering, setHovering] = useState(false)
       const hoverTimerRef = useRef(null)
 
       useEffect(() => {
-        refreshStatus(false)
-        const timer = setInterval(() => refreshStatus(false), 30_000)
+        refreshStatus()
+        const timer = setInterval(() => refreshStatus(), 30_000)
         return () => clearInterval(timer)
       }, [])
 
@@ -177,95 +270,117 @@ window.__ModuleLoader__.load({
       }
 
       const st = state.status
+      const monthlyRemaining = monthlyRemainingOf(st)
       let color = T.warn
-      let text = '连接 OpenCode'
+      let label = '连接 OpenCode'
       let value = null
 
       if (state.error) {
         color = T.err
-        text = 'OpenCode ?'
+        label = 'OpenCode ?'
+      } else if (st?.mode === 'needs_config') {
+        color = T.warn
+        label = 'OpenCode'
+        value = '未配置'
       } else if (st?.mode === 'ready') {
         if (st.ok) {
-          const pct = st.monthlyUsedPct
-          color = usageColor(pct)
-          text = 'OpenCode'
-          value = pct !== null ? `月用量 ${pct}%` : '在线'
+          color = monthlyRemaining === null ? T.warn : remainingColor(monthlyRemaining)
+          label = 'OpenCode'
+          value = monthlyRemaining !== null ? `月剩余 ${monthlyRemaining}%` : '在线'
         } else {
           color = T.err
-          text = 'OpenCode'
+          label = 'OpenCode'
           value = '异常'
         }
       }
 
+      const title = state.error
+        ? `本机状态接口异常：${state.error}`
+        : st?.mode === 'needs_config'
+          ? '尚未配置 OpenCode API Key，点击设置'
+          : st?.mode === 'ready' && !st.ok
+            ? `用量拉取异常：${st.error?.message ?? '未知错误'}`
+            : monthlyRemaining !== null
+              ? `OpenCode GO · 月剩余 ${monthlyRemaining}% · 点击查看详情`
+              : 'OpenCode GO，点击查看详情'
+
+      // rail 模式：真正的 button（键盘可达、可点击），同样打开用量视图
       if (props?.wide === false) {
         return h(
-          'div',
+          'button',
           {
-            className: 'oc-btn',
+            className: 'oc-btn oc-footer-btn',
+            type: 'button',
+            title,
+            'aria-label': '打开 OpenCode GO 用量面板',
             style: {
-              boxSizing: 'border-box',
               width: 36,
               height: 36,
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               borderRadius: 8,
+              border: `1px solid ${color === T.err ? T.err : T.border}`,
+              background: 'transparent',
+              color,
               fontSize: 10,
               fontWeight: 700,
-              color: T.label,
               cursor: 'pointer',
               margin: '2px auto',
+              padding: 0,
+              fontVariantNumeric: 'tabular-nums',
             },
-            title: st?.error?.message || `OpenCode GO ${value || ''}`,
-            onClick: () => store.set({ open: !state.open }),
+            onClick: toggleOverlay,
           },
-          st?.monthlyUsedPct !== null && st?.monthlyUsedPct !== undefined ? `${st.monthlyUsedPct}%` : 'GO',
+          monthlyRemaining !== null ? `${monthlyRemaining}%` : 'GO',
         )
       }
+
+      const segments = [
+        { text: label, color: T.label },
+        value ? { text: value, color } : null,
+      ].filter(Boolean)
+      const labelEl = h(
+        'span',
+        { style: { display: 'inline-flex', alignItems: 'center', lineHeight: '18px', whiteSpace: 'nowrap', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } },
+        segments.flatMap((s, i) =>
+          i === 0
+            ? [h('span', { key: `s${i}`, style: { color: s.color, fontWeight: 500, flexShrink: 0 } }, s.text)]
+            : [
+                h('span', { key: `sep${i}`, style: { color: T.secondary, margin: '0 5px', opacity: 0.7, flexShrink: 0 } }, '·'),
+                h('span', { key: `s${i}`, style: { color: s.color, fontWeight: 500, fontVariantNumeric: 'tabular-nums', overflow: 'hidden', textOverflow: 'ellipsis' } }, s.text),
+              ],
+        ),
+      )
 
       const node = h(
         'button',
         {
           className: 'oc-btn oc-footer-btn',
+          type: 'button',
+          title,
           onMouseEnter,
           onMouseLeave,
           style: {
             ...btnBase,
-            display: props?.wide === false ? 'inline-flex' : 'flex',
-            width: props?.wide === false ? undefined : '100%',
+            display: 'flex',
+            width: '100%',
             boxSizing: 'border-box',
-            justifyContent: props?.wide === false ? 'center' : 'flex-start',
+            justifyContent: 'flex-start',
             margin: '2px 0',
             minWidth: 0,
             flexShrink: 0,
             borderColor: state.open ? T.brand : T.border,
             background: state.open ? 'var(--dsw-alias-interactive-bg-hover, rgba(59,130,246,.12))' : 'transparent',
           },
-          onClick: () => {
-            store.set({ open: !state.open })
-            if (!state.open) {
-              refreshStatus(false)
-              refreshConfig()
-            }
-          },
+          onClick: toggleOverlay,
         },
         h('span', { className: color === T.ok ? 'oc-dot-live' : undefined, style: dotStyle(color) }),
-        h(
-          'span',
-          { style: { display: 'inline-flex', alignItems: 'center', lineHeight: '18px', whiteSpace: 'nowrap', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } },
-          [
-            h('span', { key: 't', style: { color: T.label, fontWeight: 500, flexShrink: 0 } }, text),
-            value
-              ? [
-                  h('span', { key: 'sep', style: { color: T.secondary, margin: '0 5px', opacity: 0.7, flexShrink: 0 } }, '·'),
-                  h('span', { key: 'v', style: { color, fontWeight: 500, fontVariantNumeric: 'tabular-nums', overflow: 'hidden', textOverflow: 'ellipsis' } }, value),
-                ]
-              : null,
-          ].flat().filter(Boolean),
-        ),
+        labelEl,
       )
 
-      if (!hovering || state.open || !st?.ok || !st?.windows?.length) return node
+      // 悬浮微卡：面板关闭、悬停 220ms、且 ready + ok 时才出现
+      if (!hovering || state.open || st?.mode !== 'ready' || !st.ok) return node
 
       return h(
         'div',
@@ -275,55 +390,156 @@ window.__ModuleLoader__.load({
           onMouseLeave,
         },
         node,
-        h(
-          'div',
-          {
-            className: 'oc-panel-enter',
-            style: {
-              position: 'absolute',
-              left: 0,
-              right: 0,
-              bottom: 'calc(100% + 6px)',
-              background: T.bg,
-              border: `1px solid ${T.border2}`,
-              borderRadius: '10px',
-              boxShadow: '0 8px 24px rgba(0,0,0,.18)',
-              padding: '12px 14px 4px 14px',
-              fontSize: '11px',
-              color: T.label,
-              zIndex: 100,
-              fontFamily: 'system-ui, -apple-system, sans-serif',
-            },
-          },
-          h(
-            'div',
-            {
-              style: {
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                marginBottom: 10,
-              },
-            },
-            h('span', { style: { fontWeight: 600, fontSize: '12px' } }, '🚀 OpenCode GO 用量概览'),
-            st.plan ? h('span', { style: { fontSize: '10px', color: T.brand, fontWeight: 600 } }, st.plan) : null,
-          ),
-          st.windows.map((w, i) => h(QuotaRow, { key: i, window: w })),
-        ),
+        h(HoverCard, { status: st }),
       )
     }
 
-    // ---------- 配额进度条 ----------
+    // ---------- 220ms 悬浮微卡（只读概览，无假按钮） ----------
+    function HoverCard(props) {
+      const st = props.status
+      const windows = Array.isArray(st?.windows) ? st.windows : []
+      return h(
+        'div',
+        {
+          className: 'oc-panel-enter oc-hover-card',
+          style: {
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            bottom: 'calc(100% + 6px)',
+            pointerEvents: 'none',
+            background: T.bg,
+            border: `1px solid ${T.border2}`,
+            borderRadius: 10,
+            boxShadow: '0 8px 24px rgba(0,0,0,.18)',
+            padding: '10px 12px 8px',
+            fontSize: 11,
+            color: T.label,
+            zIndex: 100,
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+          },
+        },
+        [
+          h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 } }, [
+            h('span', { key: 't', style: { fontWeight: 600, fontSize: 12, color: T.label } }, 'OpenCode GO 用量'),
+            // Go 标识（纯展示徽章，不是按钮）
+            h(
+              'span',
+              {
+                key: 'go',
+                style: {
+                  fontSize: 9,
+                  fontWeight: 700,
+                  letterSpacing: 0.4,
+                  color: '#fff',
+                  background: T.brand,
+                  borderRadius: 4,
+                  padding: '1px 5px',
+                  lineHeight: '13px',
+                  flexShrink: 0,
+                },
+              },
+              'GO',
+            ),
+            h(
+              'span',
+              { key: 'at', style: { marginLeft: 'auto', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums', flexShrink: 0 } },
+              st?.fetchedAt ? `上次同步 ${fmtClock(st.fetchedAt)}` : '尚未同步',
+            ),
+          ]),
+          h(
+            'div',
+            { key: 'rows', style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+            windows.map((w, i) => h(MiniQuotaRow, { key: w.id ?? i, window: w })),
+          ),
+          h(
+            'div',
+            { key: 'hint', style: { marginTop: 8, paddingTop: 6, borderTop: `1px dashed ${T.border}`, fontSize: 10, color: T.secondary, textAlign: 'center' } },
+            '点击查看详情',
+          ),
+        ],
+      )
+    }
+
+    /** 悬浮卡紧凑行：名称 / 剩余 % / ↻ 重置倒计时 / 细进度条。 */
+    function MiniQuotaRow(props) {
+      const w = props.window
+      const remaining = w?.remainingPct ?? null
+      const color = remainingColor(remaining)
+      return h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
+        h('span', { key: 'n', style: { width: 46, flexShrink: 0, fontSize: 10, color: T.secondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.shortLabel ?? w?.label ?? '—'),
+        h(
+          'div',
+          { key: 'bar', style: { flex: 1, minWidth: 0, height: 3, borderRadius: 2, background: `color-mix(in srgb, ${color} 16%, transparent)`, overflow: 'hidden' } },
+          remaining === null
+            ? null
+            : h('div', { style: { height: '100%', width: `${clampPct(remaining)}%`, background: color, borderRadius: 2 } }),
+        ),
+        h('span', { key: 'v', style: { minWidth: 30, textAlign: 'right', fontSize: 10, fontWeight: 600, color, fontVariantNumeric: 'tabular-nums' } }, remaining === null ? '—' : `${remaining}%`),
+        h('span', { key: 'r', style: { minWidth: 34, textAlign: 'right', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } }, w?.resetAt ? `↻ ${timeUntil(w.resetAt)}` : ''),
+      ])
+    }
+
+    // ---------- 用量视图 ----------
+    function StatusView() {
+      const state = useStore()
+      const st = state.status
+
+      if (!st) {
+        return h('div', { style: { fontSize: 12, color: T.secondary } }, state.error ? `读取状态失败：${state.error}` : '加载中…')
+      }
+
+      const windows = Array.isArray(st.windows) ? st.windows : []
+      const monthlyRemaining = monthlyRemainingOf(st)
+      const host = hostOf(st.config?.baseUrl)
+
+      return h('div', null, [
+        h('div', { key: 'sum', style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
+          h('span', { key: 'd', style: dotStyle(st.ok ? T.ok : T.err) }),
+          h('span', { key: 't', style: { fontSize: 12, fontWeight: 600, color: T.label } }, st.ok ? 'OpenCode GO 已连接' : 'OpenCode GO 异常'),
+          host ? h('span', { key: 'h', style: { fontSize: 10, color: T.secondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, host) : null,
+          monthlyRemaining !== null
+            ? h(
+                'span',
+                { key: 'm', style: { marginLeft: 'auto', fontSize: 11, fontWeight: 600, color: remainingColor(monthlyRemaining), fontVariantNumeric: 'tabular-nums', flexShrink: 0 } },
+                `月剩余 ${monthlyRemaining}%`,
+              )
+            : null,
+        ].filter(Boolean)),
+        state.error
+          ? h('div', { key: 'ce', style: { fontSize: 11, color: T.err, marginTop: 8 } }, `刷新失败：${state.error}`)
+          : null,
+        !st.ok
+          ? h('div', { key: 'se', style: { fontSize: 12, color: T.err, marginTop: 10 } }, st.error?.message ?? '网关返回异常，稍后重试')
+          : null,
+        st.ok && windows.length
+          ? h('div', { key: 'w', style: { marginTop: 14 } }, windows.map((w, i) => h(QuotaRow, { key: w.id ?? i, window: w })))
+          : null,
+        st.ok && !windows.length
+          ? h('div', { key: 'empty', style: { fontSize: 11, color: T.secondary, marginTop: 10 } }, '暂无用量窗口数据')
+          : null,
+        h(
+          'div',
+          { key: 'note', style: { fontSize: 10, color: T.secondary, marginTop: 6, lineHeight: '15px' } },
+          '上游 /v1/usage 仅提供百分比额度，界面不展示金额余额。',
+        ),
+      ].filter(Boolean))
+    }
+
+    /** 面板窗口行：已用 % + 剩余 % + 重置倒计时 + 进度条（按剩余额度着色）。 */
     function QuotaRow(props) {
       const w = props.window
-      const used = w.usedPct
-      const color = usageColor(used)
-      return h('div', { style: { marginBottom: 10 } }, [
-        h('div', { key: 'label', style: { display: 'flex', fontSize: 11, marginBottom: 3, fontVariantNumeric: 'tabular-nums' } }, [
-          h('span', { style: { color: T.label, fontWeight: 500 } }, w.label),
-          h('span', { style: { marginLeft: 'auto', color, fontWeight: 600 } }, used !== null ? `${used}%` : '—'),
-          w.resetAt ? h('span', { style: { color: T.secondary, marginLeft: 6 } }, `↻ ${timeUntil(w.resetAt)}`) : null,
-        ]),
+      const used = w?.usedPct ?? null
+      const remaining = w?.remainingPct ?? null
+      const color = remainingColor(remaining)
+      const statusText = w?.status && w.status !== 'ok' ? w.status : null
+      return h('div', { style: { marginBottom: 12 } }, [
+        h('div', { key: 'meta', style: { display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 11, marginBottom: 4, fontVariantNumeric: 'tabular-nums' } }, [
+          h('span', { key: 'l', style: { color: T.label, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.label ?? '—'),
+          h('span', { key: 'u', style: { marginLeft: 'auto', color: T.secondary, flexShrink: 0 } }, used === null ? '已用 —' : `已用 ${used}%`),
+          h('span', { key: 'r', style: { color, fontWeight: 600, flexShrink: 0 } }, remaining === null ? '剩余 —' : `剩余 ${remaining}%`),
+          w?.resetAt ? h('span', { key: 't', style: { color: T.secondary, flexShrink: 0 } }, `↻ ${timeUntil(w.resetAt)}`) : null,
+        ].filter(Boolean)),
         h(
           'div',
           {
@@ -336,22 +552,25 @@ window.__ModuleLoader__.load({
               overflow: 'hidden',
             },
           },
-          used === null
+          remaining === null
             ? null
             : h('div', {
                 style: {
                   height: '100%',
-                  width: `${Math.max(0, Math.min(100, used))}%`,
+                  width: `${clampPct(remaining)}%`,
                   background: color,
                   borderRadius: 3,
                   transition: 'width 0.4s ease',
                 },
               }),
         ),
-      ])
+        statusText
+          ? h('div', { key: 'st', style: { fontSize: 10, color: T.warn, marginTop: 3 } }, `窗口状态异常：${statusText}`)
+          : null,
+      ].filter(Boolean))
     }
 
-    // ---------- 配置卡片 ----------
+    // ---------- 连接设置视图 ----------
     function ConfigCard() {
       const state = useStore()
       const cfg = state.config
@@ -374,7 +593,8 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ baseUrl, ...(apiKey ? { apiKey } : {}) }),
           })
-          store.set({ status: result.status, config: result.config })
+          // 保存成功后回到用量视图
+          store.set({ status: result.status, config: result.config, view: 'status', error: null })
           setApiKey('')
         } catch (e) {
           setError(e?.message ?? '保存失败')
@@ -393,7 +613,7 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ baseUrl, clearApiKey: true }),
           })
-          store.set({ status: result.status, config: result.config })
+          store.set({ status: result.status, config: result.config, error: null })
         } catch (e) {
           setError(e?.message ?? '清除失败')
         } finally {
@@ -406,12 +626,12 @@ window.__ModuleLoader__.load({
         setBaseUrl(cfg?.baseUrl ?? '')
         setApiKey('')
         setError(null)
-        store.set({ open: false })
+        store.set({ open: false, view: 'status' })
       }
 
       return h('div', null, [
         h('div', { key: 'u', style: { marginBottom: 10 } }, [
-          h('label', { style: { display: 'block', fontSize: 12, color: T.secondary, marginBottom: 4 } }, 'Base URL'),
+          h('label', { style: labelStyle }, 'Base URL'),
           h('input', {
             style: inputStyle,
             value: baseUrl,
@@ -420,7 +640,7 @@ window.__ModuleLoader__.load({
           }),
         ]),
         h('div', { key: 'k', style: { marginBottom: 10 } }, [
-          h('label', { style: { display: 'block', fontSize: 12, color: T.secondary, marginBottom: 4 } }, `API Key *${keyState.configured ? `（已保存 ${keyState.hint}）` : ''}`),
+          h('label', { style: labelStyle }, `API Key *${keyState.configured ? `（已保存 ${keyState.hint}）` : ''}`),
           h('input', {
             style: { ...inputStyle, opacity: keyState.writable ? 1 : 0.6 },
             type: 'password',
@@ -434,35 +654,101 @@ window.__ModuleLoader__.load({
         h('div', { key: 'btns', style: { display: 'flex', gap: 8, marginTop: 12, alignItems: 'center' } }, [
           h(
             'button',
-            { className: 'oc-btn oc-btn-primary', style: { ...btnBase, background: T.brand, borderColor: T.brand, color: '#fff' }, disabled: saving, onClick: save },
+            { className: 'oc-btn', style: { ...btnBase, background: T.brand, borderColor: T.brand, color: '#fff' }, disabled: saving, onClick: save },
             saving ? '保存中…' : '保存并连接',
           ),
           h('button', { className: 'oc-btn', style: btnBase, disabled: saving, onClick: cancel }, '取消'),
           keyState.configured && keyState.writable
             ? h('button', { className: 'oc-btn', style: { ...btnBase, color: T.err, marginLeft: 'auto' }, disabled: saving, onClick: clearKey }, '清除')
             : null,
-        ]),
+        ].filter(Boolean)),
       ])
     }
 
-    // ---------- 浮层配置面板（点击进入控制台管理，用量已在悬浮卡片展示） ----------
+    // ---------- 固定底部操作条 ----------
+    function OpsBar(props) {
+      const state = useStore()
+      const st = state.status
+      const lastSync = st?.fetchedAt ? fmtClock(st.fetchedAt) : null
+
+      if (props?.settings) {
+        return h('div', { style: barStyle }, [
+          // 只有未配置（needs_config）时没有可返回的用量视图；status 尚未加载时也要保留返回入口。
+          st?.mode !== 'needs_config'
+            ? h(
+                'button',
+                {
+                  className: 'oc-btn',
+                  style: btnBase,
+                  onClick: () => {
+                    store.set({ view: 'status' })
+                    refreshStatus()
+                  },
+                },
+                '← 返回用量',
+              )
+            : null,
+          h(
+            'span',
+            { style: { marginLeft: 'auto', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } },
+            lastSync ? `上次同步 ${lastSync}` : '尚未同步',
+          ),
+        ].filter(Boolean))
+      }
+
+      return h(
+        'div',
+        { style: barStyle },
+        [
+          h(
+            'button',
+            {
+              className: 'oc-btn',
+              style: btnBase,
+              disabled: state.refreshing,
+              onClick: manualRefresh,
+              title: '绕过 30 秒缓存，强制重新拉取当前剩余额度',
+            },
+            h('span', { key: 'i', className: state.refreshing ? 'oc-spin' : undefined }, '↻'),
+            state.refreshing ? '刷新中…' : '刷新',
+          ),
+          h('button', { key: 'set', className: 'oc-btn', style: btnBase, onClick: openSettings, title: '配置 Base URL 与 API Key' }, '⚙ 设置'),
+          h(
+            'span',
+            { key: 'at', style: { marginLeft: 'auto', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } },
+            lastSync ? `上次同步 ${lastSync}` : '尚未同步',
+          ),
+        ],
+      )
+    }
+
+    const barStyle = {
+      flexShrink: 0,
+      borderTop: `1px solid ${T.border}`,
+      padding: '10px 16px 12px',
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+    }
+
+    // ---------- Overlay 面板（状态视图 / 设置视图） ----------
     function OverlayPanel() {
       const state = useStore()
       const panelRef = useRef(null)
+      // 相位机：closed → open → closing（播完退场动画）→ closed。
+      // 拆成两个 effect：否则 phase 变化会清掉「170ms 后置 closed」的定时器，面板卡在不可见仍拦截点击的状态。
       const [phase, setPhase] = useState('closed')
-
       useEffect(() => {
         if (state.open) setPhase('open')
         else setPhase((p) => (p === 'open' ? 'closing' : p))
       }, [state.open])
-
       useEffect(() => {
         if (phase !== 'closing') return
-        const timer = setTimeout(() => setPhase('closed'), 160)
+        const timer = setTimeout(() => setPhase('closed'), 170)
         return () => clearTimeout(timer)
       }, [phase])
 
-      // 点击外部关闭
+      // 点击外部关闭；footer 常驻按钮自身不在面板内，放行它的点击。
       useEffect(() => {
         if (!state.open) return
         const handleClickOutside = (e) => {
@@ -478,6 +764,8 @@ window.__ModuleLoader__.load({
       if (phase === 'closed') return null
 
       const st = state.status
+      // 未配置时必须直接落在设置视图；其余情况由 store.view 决定。
+      const settingsView = state.view === 'settings' || st?.mode === 'needs_config'
 
       return h(
         'div',
@@ -488,75 +776,42 @@ window.__ModuleLoader__.load({
             position: 'fixed',
             left: 12,
             bottom: 52,
-            width: 320,
+            width: 360,
+            maxHeight: 'calc(100vh - 80px)',
+            overflow: 'hidden',
+            display: 'flex',
+            flexDirection: 'column',
             background: T.bg,
             border: `1px solid ${T.border}`,
             borderRadius: 16,
             boxShadow: 'var(--dsw-shadow-lv3, 0 10px 32px rgba(0,0,0,0.4))',
-            padding: '14px 16px 12px',
             zIndex: 60,
             pointerEvents: phase === 'closing' ? 'none' : 'auto',
           },
         },
         [
-          // 头部
-          h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, borderBottom: `1px solid ${T.border}`, paddingBottom: 8 } }, [
-            h('span', { style: { fontSize: 13, fontWeight: 600, color: T.label } }, '⚙ OpenCode GO 连接配置'),
-            h('div', { style: { display: 'flex', gap: 4, alignItems: 'center' } }, [
-              h(
-                'button',
-                {
-                  className: 'oc-btn',
-                  style: {
-                    width: 26,
-                    height: 26,
-                    padding: 0,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: 14,
-                    border: 'none',
-                    borderRadius: 6,
-                    cursor: 'pointer',
-                    color: T.secondary,
-                    background: 'transparent',
-                  },
-                  onClick: async () => {
-                    store.set({ refreshing: true })
-                    await refreshStatus(true)
-                    store.set({ refreshing: false })
-                  },
-                  title: '强制刷新同步',
-                },
-                state.refreshing ? h('span', { className: 'oc-spin' }, '↻') : '↻',
-              ),
-              h(
-                'button',
-                {
-                  className: 'oc-btn',
-                  style: {
-                    width: 26,
-                    height: 26,
-                    padding: 0,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: 13,
-                    border: 'none',
-                    borderRadius: 6,
-                    cursor: 'pointer',
-                    color: T.secondary,
-                    background: 'transparent',
-                  },
-                  onClick: () => store.set({ open: false }),
-                  title: '关闭',
-                },
-                '✕',
-              ),
-            ]),
-          ]),
-          // 内容：直接展示配置与连接管理
-          h(ConfigCard),
+          // 固定头部：标题 + 关闭
+          h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', padding: '14px 16px 10px', borderBottom: `1px solid ${T.border}`, flexShrink: 0 } }, [
+            h('span', { key: 't', style: { fontSize: 13, fontWeight: 600, color: T.label } }, settingsView ? '⚙ OpenCode GO 连接配置' : 'OpenCode GO 用量'),
+            !settingsView && st?.config?.baseUrl
+              ? h('span', { key: 'h', style: { fontSize: 10, color: T.secondary, marginLeft: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, hostOf(st.config.baseUrl))
+              : null,
+            h(
+              'button',
+              {
+                key: 'x',
+                className: 'oc-btn',
+                style: { ...btnBase, marginLeft: 'auto', border: 'none', padding: '2px 6px' },
+                onClick: closeOverlay,
+                title: '关闭',
+              },
+              '✕',
+            ),
+          ].filter(Boolean)),
+          // 滚动内容区
+          h('div', { key: 'body', style: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '12px 16px' } }, settingsView ? h(ConfigCard) : h(StatusView)),
+          // 固定底部操作条：刷新 / 设置 / 上次同步
+          h(OpsBar, { key: 'ops', settings: settingsView }),
         ],
       )
     }
