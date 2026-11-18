@@ -634,19 +634,27 @@ test('热改 baseUrl / keyRef 后缓存立即失效，下一次 GET 重新拉取
   }
 })
 
-test('package.json 升到 0.3.0，并保留 DSH 0.2.x 兼容范围', () => {
+test('package.json 版本与 CHANGELOG 顶部一致，并保留 DSH 0.2.x 兼容范围', () => {
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-  assert.equal(manifest.version, '0.3.0')
+  const changelog = readFileSync(new URL('../CHANGELOG.md', import.meta.url), 'utf8')
+  // 版本号不再钉死：以 package.json 为唯一事实源，要求 CHANGELOG 顶部标题跟随同一版本。
+  const changelogVersion = /^# Changelog\n\n## ([^\s]+)\n/.exec(changelog)?.[1] ?? null
+  assert.equal(changelogVersion, manifest.version)
+  // 仍是合法的三段式 semver，避免版本字段被写成空串或非法值也能过。
+  assert.match(manifest.version, /^\d+\.\d+\.\d+$/)
   assert.equal(manifest.engines.node, '>=20')
-  // 上界写成 `<0.3.0-0`：0.3.0 的预发布版（0.3.0-rc.1 / rc.2）也因此 UNMET。
+  // DSH 兼容上界与插件自身版本无关，必须保持显式钉死（`<0.3.0-0` 让 0.3.0 的预发布版同样 UNMET）。
   // 该范围语义由宿主 app-boot 的 evaluatePluginCompatibility 验证：
   // 0.2.2-rc.1 → COMPATIBLE；0.3.0-rc.1 / 0.3.0-rc.2 / 0.3.0 → UNMET（见 CHANGELOG 0.2.1）。
   assert.equal(manifest.engines.dsh, '>=0.2.0 <0.3.0-0')
 })
 
-test('CHANGELOG 顶部是 0.3.0，README 描述新的点击/刷新/设置/悬浮行为', () => {
+test('CHANGELOG 顶部是当前发布版本，README 描述新的点击/刷新/设置/悬浮行为', () => {
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  // 用 package.json 的实际版本拼正则，避免每次发版再钉死；点号等正则元字符做转义。
+  const escapedVersion = manifest.version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const changelog = readFileSync(new URL('../CHANGELOG.md', import.meta.url), 'utf8')
-  assert.match(changelog, /^# Changelog\n\n## 0\.3\.0\n/)
+  assert.match(changelog, new RegExp('^# Changelog\\n\\n## ' + escapedVersion + '\\n'))
   assert.match(changelog, /用量面板/)
   assert.match(changelog, /刷新/)
 
