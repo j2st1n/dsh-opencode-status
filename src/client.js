@@ -246,8 +246,10 @@ window.__ModuleLoader__.load({
 
     /**
      * 估算文案的三态：不可估算返回 null（调用方完全不渲染节点，不显示 "--"/"估算中" 之类占位）；
-     * 撑不到重置用告警色「X 耗尽」，撑得到用中性色「可支撑到重置」。
+     * 撑不到重置用告警色「约 X 后耗尽」，撑得到用中性色「可支撑到重置」。
      * 文案只用「按当前速率」的描述，不用「预计/将」这种预测口吻。
+     * 行内必须保留「约」与「后」：这是常驻可见的唯一表述（悬浮卡等场景 title 不可达），
+     * 缺了「约」会被读成确定性断言，与「仅供参考」的定位冲突。
      * compact（悬浮微卡，外宽约 220px）整段不展示：一行放不下「名称/条/剩余/估算/倒计时」五项，
      * 缩字号、砍进度条/倒计时、截断估算都不可接受，所以宁可不显示；估算逻辑仍共用 estimateEta，只是呈现密度不同。
      * 这是有意为之，不是漏渲染。
@@ -261,9 +263,9 @@ window.__ModuleLoader__.load({
       const minutes = Math.max(1, Math.round(estimate.spanMs / 60_000))
       // 文案只说「按最近 N 分钟的消耗速率（按当前速率）」的实测依据，不写「预计/将」这类预测口吻。
       const title = `按最近 ${minutes} 分钟的消耗速率估算（按当前速率），仅供参考`
-      // 行内去掉「约/后」压缩到最短（档位徽标 + 长 ETA 同时出现时，保证档位/剩余/倒计时都不被挤掉）。
+      // 保留完整字面「约 X 后耗尽」：真实 Chrome 实测在 326px/262px 内容宽下都不会截断，只会让标签多收缩。
       return estimate.exhaustsBeforeReset
-        ? { text: `${fmtEtaDuration(estimate.etaMs)} 耗尽`, color: T.warn, title }
+        ? { text: `约 ${fmtEtaDuration(estimate.etaMs)} 后耗尽`, color: T.warn, title }
         : { text: '可支撑到重置', color: T.secondary, title }
     }
 
