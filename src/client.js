@@ -721,7 +721,7 @@ window.__ModuleLoader__.load({
         h('div', { key: 'sum', style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
           h('span', { key: 'd', style: dotStyle(st.ok ? T.ok : T.err) }),
           // 窄视口下让标题让位给右侧摘要：摘要 flexShrink:0，标题可省略。
-          h('span', { key: 't', style: { fontSize: 12, fontWeight: 600, color: T.label, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 1 } }, st.ok ? 'OpenCode GO 已连接' : 'OpenCode GO 异常'),
+          h('span', { key: 't', style: { fontSize: 12, fontWeight: 600, color: T.label, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 1 } }, st.ok ? '已连接' : '异常'),
           tightest
             ? h(
                 'span',
@@ -733,7 +733,7 @@ window.__ModuleLoader__.load({
                 },
                 // 用 label 而不是 shortLabel：shortLabel 是给 220px 悬浮微卡的窄列设计的紧凑缩写，
                 // 复用到这里会把「Weekly / Monthly」这类英文缩写漏进主面板。
-                `最紧张 ${tightest.label ?? tightest.id ?? '—'} ${pctText(tightest.remainingPct)}`,
+                `最紧张 ${tightest.label ?? tightest.id ?? '—'}`,
               )
             : null,
         ].filter(Boolean)),

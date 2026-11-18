@@ -1153,7 +1153,9 @@ test('运行时验证：手动刷新后更早的 GET 成功/失败响应都被�
   await flush()
   const panelText = collect(app.registered[1]()).join('|')
   // 新语义：头部给「最紧张窗口」摘要，窗口行只留剩余主百分比，已用降级到 aria/title
-  assert.match(panelText, /最紧张 月窗口 90%/)
+  assert.match(panelText, /最紧张 月窗口/)
+  // 摘要不再重复窗口行已有的数字：百分比只在该窗口行出现一次
+  assert.doesNotMatch(panelText, /最紧张 月窗口 90%/)
   assert.match(panelText, /剩余 90%/)
   assert.match(panelText, /已用 10%/)
   assert.doesNotMatch(panelText, /剩余 10%|已用 90%/)
@@ -1171,7 +1173,7 @@ test('运行时验证：手动刷新后更早的 GET 成功/失败响应都被�
   oldGet2.reject(new Error('stale GET failed'))
   await flush()
   const panelText2 = collect(app2.registered[1]()).join('|')
-  assert.match(panelText2, /最紧张 月窗口 90%/)
+  assert.match(panelText2, /最紧张 月窗口/)
   assert.doesNotMatch(panelText2, /刷新失败/)
 })
 
