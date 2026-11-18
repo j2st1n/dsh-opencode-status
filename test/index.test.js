@@ -684,8 +684,8 @@ test('底部操作条「刷新」调用 sync 且带 JSON 内容类型，展示�
   assert.match(text, /disabled: state\.refreshing/)
   assert.match(text, /'刷新中…'/)
   assert.match(text, /className: state\.refreshing \? 'oc-spin' : undefined/)
-  // 上次同步时间取 status.fetchedAt，格式 HH:MM:SS
-  assert.match(text, /const lastSync = st\?\.fetchedAt \? fmtClock\(st\.fetchedAt\) : null/)
+  // 上次同步显示相对时间，绝对时刻放 title（HH:MM:SS）
+  assert.match(text, /const lastSync = st\?\.fetchedAt \? fmtRelative\(st\.fetchedAt\) : null/)
   assert.match(text, /上次同步 \$\{lastSync\}/)
   assert.match(text, /pad\(d\.getHours\(\)\)/)
   // 失败时在面板内显示错误文案，而不是静默
@@ -702,11 +702,12 @@ test('设置视图可保存回用量视图、「取消」丢弃编辑并关闭�
   assert.match(text, /'← 返回用量'/)
 })
 
-test('三个窗口行同时给出已用/剩余百分比、倒计时与按剩余阈值着色的进度条', () => {
+test('三个窗口行给出剩余主百分比、降级已用、倒计时与按剩余阈值着色的进度条', () => {
   const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
   const quotaRow = text.slice(text.indexOf('function QuotaRow'), text.indexOf('// ---------- 连接设置视图'))
-  assert.match(quotaRow, /已用 \$\{used\}%/)
-  assert.match(quotaRow, /剩余 \$\{remaining\}%/)
+  // 行内只保留「剩余」一个主百分比；「已用」降级到 title 与 aria-valuetext，避免同行重复表达
+  assert.match(quotaRow, /已用 \$\{pctText\(used\)\}/)
+  assert.match(quotaRow, /剩余 \$\{pctText\(remaining\)\}/)
   assert.match(quotaRow, /timeUntil\(w\.resetAt\)/)
   assert.match(quotaRow, /clampPct\(remaining\)/)
   assert.match(quotaRow, /remainingColor\(remaining\)/)
@@ -717,6 +718,171 @@ test('三个窗口行同时给出已用/剩余百分比、倒计时与按剩余�
   assert.match(text, /if \(remaining > 20\) return T\.warn/)
   // 不编造金额余额，只用剩余额度/百分比表述（源码不含 $10 / ¥10 这类货币金额）
   assert.doesNotMatch(text, /[\$¥€]\s?\d/)
+})
+
+test('面板可 Esc 关闭、具备 dialog 语义与焦点归还，进度条暴露 progressbar ARIA（P0）', () => {
+  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  const panel = text.slice(text.indexOf('function OverlayPanel'), text.indexOf('// ---------- 注册'))
+
+  // Esc 关闭：keydown 监听以 state.open 为门，随面板打开注册、关闭卸载
+  assert.match(panel, /if \(!state\.open\) return[\s\S]{0,200}e\.key === 'Escape'/)
+  assert.match(panel, /window\.addEventListener\('keydown', handleKeyDown\)/)
+  assert.match(panel, /return \(\) => window\.removeEventListener\('keydown', handleKeyDown\)/)
+  // 非模态对话框：role + aria-label，但不声明 aria-modal（允许点击外部关闭，外部内容仍可交互）
+  assert.match(panel, /role: 'dialog'/)
+  assert.match(panel, /'aria-label': settingsView \? 'OpenCode GO 连接配置' : 'OpenCode GO 用量'/)
+  assert.doesNotMatch(panel, /'aria-modal'/)
+  // 打开时焦点移入面板（容器 tabIndex=-1），关闭时归还触发元素
+  assert.match(panel, /tabIndex: -1/)
+  assert.match(panel, /if \(panel && typeof panel\.focus === 'function'\) panel\.focus\(\)/)
+  assert.match(panel, /previous\.focus\(\)/)
+  // 点击外部关闭时不抢走用户刚点中的控件焦点
+  assert.match(panel, /panel\.contains\(active\)/)
+  // Tab 在面板内首尾循环，不立即逃到背后的不可见区域
+  assert.match(panel, /e\.key !== 'Tab'/)
+  assert.match(panel, /FOCUSABLE/)
+
+  const quotaRow = text.slice(text.indexOf('function QuotaRow'), text.indexOf('// ---------- 连接设置视图'))
+  // 进度条语义：role + valuemin/max/now + 可读文本；剩余缺失时不给 valuenow
+  assert.match(quotaRow, /role: 'progressbar'/)
+  assert.match(quotaRow, /'aria-valuemin': 0/)
+  assert.match(quotaRow, /'aria-valuemax': 100/)
+  assert.match(quotaRow, /'aria-valuenow': Math\.round\(clampPct\(remaining\)\)/)
+  assert.match(quotaRow, /'aria-valuetext'/)
+  assert.match(quotaRow, /remaining === null \? '数据不可用' :/)
+  // 低额度除颜色外有文字档位（阈值与 remainingColor 一致）
+  const band = text.slice(text.indexOf('function remainingBand'), text.indexOf('function fmtRelative'))
+  assert.match(band, /if \(remaining <= 20\) return '即将耗尽'/)
+  assert.match(band, /if \(remaining <= 50\) return '偏低'/)
+  assert.match(quotaRow, /⚠ \$\{band\}/)
+})
+
+test('面板宽度自适应窄视口，390px 下不横向溢出（P0）', () => {
+  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  assert.match(text, /width: 'min\(360px, calc\(100vw - 24px\)\)'/)
+  assert.match(text, /maxWidth: 'calc\(100vw - 24px\)'/)
+  assert.match(text, /boxSizing: 'border-box'/)
+  assert.doesNotMatch(text, /width: 360,/)
+})
+
+test('P1 信息设计：相对时间/过期提示、单一主百分比、免责说明移入设置、倒计时与呼吸动画一次性', () => {
+  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+
+  // 相对时间 + 绝对时间 title + 超过 2 分钟的弱过期提示
+  assert.match(text, /function fmtRelative\(ts, now = Date\.now\(\)\)/)
+  assert.match(text, /const STALE_AFTER_MS = 2 \* 60_000/)
+  assert.match(text, /title: lastSyncTitle/)
+  assert.match(text, /上次同步 \$\{lastSync\}\$\{lastSyncStale \? ' · 可能已过期' : ''\}/)
+  assert.match(text, /const lastSyncTitle = st\?\.fetchedAt \? `上次同步 \$\{fmtClock\(st\.fetchedAt\)\}` : '尚未同步'/)
+
+  // 头部给判断性摘要，不再与月窗口行重复「月剩余 N%」
+  const statusView = text.slice(text.indexOf('function StatusView'), text.indexOf('function QuotaRow'))
+  assert.match(statusView, /最紧张 \$\{tightest\.shortLabel \?\? tightest\.label \?\? '—'\}/)
+  assert.doesNotMatch(statusView, /月剩余/)
+  assert.doesNotMatch(statusView, /hostOf\(/)
+  // host 只在面板标题行展示一次
+  assert.match(text, /hostOf\(st\.config\.baseUrl\)/)
+
+  // 窗口行只保留一个可见主百分比，「已用」降级到 title/aria
+  const quotaRow = text.slice(text.indexOf('function QuotaRow'), text.indexOf('// ---------- 连接设置视图'))
+  const meta = quotaRow.slice(quotaRow.indexOf("key: 'meta'"), quotaRow.indexOf("key: 'track'"))
+  assert.match(meta, /剩余 \$\{pctText\(remaining\)\}/)
+  assert.doesNotMatch(meta, /已用/)
+  assert.match(quotaRow, /已用 \$\{pctText\(used\)\} · 剩余 \$\{pctText\(remaining\)\}/)
+  // 代码注释说明条-文字语义
+  assert.match(text, /条长 = 剩余额度占比/)
+
+  // 免责说明不再常驻用量视图，移入设置视图
+  assert.doesNotMatch(statusView, /上游 \/v1\/usage/)
+  const configCard = text.slice(text.indexOf('function ConfigCard'), text.indexOf('// ---------- 固定底部操作条'))
+  assert.match(configCard, /上游 \/v1\/usage 仅提供百分比额度，界面不展示金额余额。/)
+  // 设置视图与用量视图都按需保留免责说明以外的内容
+
+  // 倒计时不再复用刷新用的 ↻
+  assert.doesNotMatch(quotaRow, /`↻/)
+  assert.match(quotaRow, /⏱ \$\{timeUntil\(w\.resetAt\)\}/)
+  const miniRow = text.slice(text.indexOf('function MiniQuotaRow'), text.indexOf('// ---------- 用量视图'))
+  assert.doesNotMatch(miniRow, /`↻/)
+  assert.match(miniRow, /⏱ \$\{timeUntil\(w\.resetAt\)\}/)
+
+  // 呼吸动画只播一次，不再无限循环
+  assert.match(text, /\.oc-dot-live \{ animation: ocPulse 1\.2s ease-out 1 both \}/)
+  assert.doesNotMatch(text, /oc-dot-live \{ animation: ocPulse[^}]*infinite/)
+})
+
+test('轮询在 document.hidden 时暂停、恢复可见立即补拉，间隔仍为 30s（P1）', () => {
+  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  // 30 秒 GET 自动刷新保持不变（宿主缓存 TTL 也是 30s）
+  assert.match(text, /setInterval\(\(\) => refreshStatus\(\), 30_000\)/)
+  assert.match(text, /const onVisibilityChange = \(\) => \{[\s\S]{0,260}refreshStatus\(\)[\s\S]{0,120}setInterval\(\(\) => refreshStatus\(\), 30_000\)/)
+  assert.match(text, /document\.hidden/)
+  assert.match(text, /typeof document\.addEventListener === 'function'/)
+  assert.match(text, /removeEventListener\('visibilitychange', onVisibilityChange\)/)
+})
+
+test('上游小数与越界百分比被取整并钳制到 0–100（P0）', async () => {
+  const originalFetch = globalThis.fetch
+  const app = harness({ credentials: { [DEFAULT_KEY_REF]: 'pct-key-1234' } })
+  const route = app.routes.get('/api/opencode-status')
+  const usage = (percent) => new Response(JSON.stringify({ usage: { rolling: { percent }, weekly: { percent }, monthly: { percent } } }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })
+
+  try {
+    globalThis.fetch = async () => usage(12.7)
+    const rounded = await invoke(route, 'GET', '/api/opencode-status?force=1')
+    assert.equal(rounded.body.windows[0].usedPct, 13)
+    assert.equal(rounded.body.windows[0].remainingPct, 87)
+    assert.equal(rounded.body.monthlyUsedPct, 13)
+
+    globalThis.fetch = async () => usage(150)
+    const over = await invoke(route, 'GET', '/api/opencode-status?force=1')
+    assert.equal(over.body.windows[0].usedPct, 100)
+    assert.equal(over.body.windows[0].remainingPct, 0)
+
+    globalThis.fetch = async () => usage(-30)
+    const under = await invoke(route, 'GET', '/api/opencode-status?force=1')
+    assert.equal(under.body.windows[0].usedPct, 0)
+    assert.equal(under.body.windows[0].remainingPct, 100)
+
+    // 所有窗口的百分比都必须是 0–100 的整数
+    for (const w of rounded.body.windows) {
+      for (const value of [w.usedPct, w.remainingPct]) {
+        assert.equal(Number.isInteger(value), true)
+        assert.equal(value >= 0 && value <= 100, true)
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('GATEWAY_ERROR 不前移「上次同步」：沿用最后一次成功时间，从未成功则为 null', async () => {
+  const originalFetch = globalThis.fetch
+
+  try {
+    const app = harness({ credentials: { [DEFAULT_KEY_REF]: 'stale-time-1234' } })
+    const route = app.routes.get('/api/opencode-status')
+
+    globalThis.fetch = async () => gatewayResponse()
+    const ready = await invoke(route, 'GET', '/api/opencode-status?force=1')
+    assert.equal(ready.body.ok, true)
+
+    globalThis.fetch = async () => new Response('gateway down', { status: 503 })
+    const failed = await invoke(route, 'GET', '/api/opencode-status?force=1')
+    assert.equal(failed.body.ok, false)
+    assert.equal(failed.body.error.code, 'GATEWAY_ERROR')
+    assert.equal(failed.body.fetchedAt, ready.body.fetchedAt)
+
+    // 从未成功过：fetchedAt 为 null，界面据此显示「尚未同步」而不是一个假的同步时刻
+    const fresh = harness({ credentials: { [DEFAULT_KEY_REF]: 'never-ok-1234' } })
+    const never = await invoke(fresh.routes.get('/api/opencode-status'), 'GET', '/api/opencode-status')
+    assert.equal(never.body.error.code, 'GATEWAY_ERROR')
+    assert.equal(never.body.fetchedAt, null)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('侧栏按钮按月剩余着色，rail 模式渲染真正的 button 并打开用量视图', () => {
@@ -898,6 +1064,10 @@ test('运行时验证：手动刷新后更早的 GET 成功/失败响应都被�
       collect(node.type(node.props), out)
       return out
     }
+    // aria-valuetext / title 是读屏与悬停可见的信息，和文本一起参与断言
+    for (const key of ['aria-valuetext', 'title']) {
+      if (typeof node.props?.[key] === 'string') out.push(node.props[key])
+    }
     node.children.forEach((n) => collect(n, out))
     return out
   }
@@ -955,9 +1125,11 @@ test('运行时验证：手动刷新后更早的 GET 成功/失败响应都被�
   oldGet.resolve({ ok: true, json: async () => stale })
   await flush()
   const panelText = collect(app.registered[1]()).join('|')
-  assert.match(panelText, /月剩余 90%/)
+  // 新语义：头部给「最紧张窗口」摘要，窗口行只留剩余主百分比，已用降级到 aria/title
+  assert.match(panelText, /最紧张 Monthly 90%/)
+  assert.match(panelText, /剩余 90%/)
   assert.match(panelText, /已用 10%/)
-  assert.doesNotMatch(panelText, /月剩余 10%|已用 90%/)
+  assert.doesNotMatch(panelText, /剩余 10%|已用 90%/)
 
   // 失败路径：POST 先返回，旧 GET 随后失败 → 不能覆盖状态也不能写入错误
   const app2 = createRuntime()
@@ -972,7 +1144,7 @@ test('运行时验证：手动刷新后更早的 GET 成功/失败响应都被�
   oldGet2.reject(new Error('stale GET failed'))
   await flush()
   const panelText2 = collect(app2.registered[1]()).join('|')
-  assert.match(panelText2, /月剩余 90%/)
+  assert.match(panelText2, /最紧张 Monthly 90%/)
   assert.doesNotMatch(panelText2, /刷新失败/)
 })
 

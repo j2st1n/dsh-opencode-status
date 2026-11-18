@@ -30,7 +30,8 @@ window.__ModuleLoader__.load({
       .oc-btn:active:not(:disabled) { transform: scale(.98) }
       .oc-btn:disabled { opacity: .55; cursor: default }
       .oc-spin { display: inline-block; animation: ocSpin .8s linear infinite }
-      .oc-dot-live { animation: ocPulse 2.4s ease-out infinite }
+      /* 状态灯呼吸只播一次：数据/状态变化时由 React key 换新节点重播，不再无限循环抢注意力 */
+      .oc-dot-live { animation: ocPulse 1.2s ease-out 1 both }
       /* 悬浮微卡只读：不接收任何指针事件，避免遮挡 footer 按钮的点击 */
       .oc-hover-card { pointer-events: none !important }
       @media (prefers-reduced-motion: reduce) {
@@ -93,6 +94,9 @@ window.__ModuleLoader__.load({
 
     const labelStyle = { display: 'block', fontSize: 12, color: T.secondary, marginBottom: 4 }
 
+    // 面板内的可聚焦元素：仅用于 Tab 首尾循环，不是完整的焦点陷阱。
+    const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
+
     function timeUntil(ts) {
       if (!ts) return ''
       const diff = ts - Date.now()
@@ -120,8 +124,50 @@ window.__ModuleLoader__.load({
       return T.err
     }
 
+    /** 额度档位文字：颜色之外再给一个非颜色信号（色盲用户与读屏都不能只靠颜色），阈值与 remainingColor 对齐。 */
+    function remainingBand(remaining) {
+      if (remaining === null || remaining === undefined) return null
+      if (remaining <= 20) return '即将耗尽'
+      if (remaining <= 50) return '偏低'
+      return null
+    }
+
+    /** 相对时间：面板显示「12s 前」「3 分钟前」，绝对时间放 title，避免每次轮询都盯着一串时分秒。 */
+    function fmtRelative(ts, now = Date.now()) {
+      if (!ts) return ''
+      const diff = Math.max(0, now - ts)
+      if (diff < 10_000) return '刚刚'
+      const secs = Math.floor(diff / 1000)
+      if (secs < 60) return `${secs}s 前`
+      const mins = Math.floor(secs / 60)
+      if (mins < 60) return `${mins} 分钟前`
+      const hours = Math.floor(mins / 60)
+      if (hours < 24) return `${hours} 小时前`
+      return `${Math.floor(hours / 24)} 天前`
+    }
+
+    /** 同步数据超过 2 分钟未更新：给弱过期提示，避免把旧额度当成实时值。 */
+    const STALE_AFTER_MS = 2 * 60_000
+
     function clampPct(value) {
       return Math.max(0, Math.min(100, value))
+    }
+
+    /** 百分比显示值：取整并钳制到 0–100（宿主已规整，这里再兜一层，旧数据也不会出现小数或越界值）。 */
+    function pctText(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+      return `${Math.round(clampPct(value))}%`
+    }
+
+    /** 最紧张的用量窗口：头部只给判断性摘要，避免与窗口行重复表达同一个数字。 */
+    function tightestWindow(status) {
+      const windows = Array.isArray(status?.windows) ? status.windows : []
+      let tightest = null
+      for (const w of windows) {
+        if (typeof w?.remainingPct !== 'number') continue
+        if (!tightest || w.remainingPct < tightest.remainingPct) tightest = w
+      }
+      return tightest
     }
 
     /** 月窗口剩余百分比；上游只给百分比，不存在金额余额。 */
@@ -256,8 +302,22 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         refreshStatus()
-        const timer = setInterval(() => refreshStatus(), 30_000)
-        return () => clearInterval(timer)
+        // 30 秒 GET 自动刷新；页面隐藏时暂停轮询，恢复可见时立即补拉一次，避免后台空转探测上游。
+        let timer = setInterval(() => refreshStatus(), 30_000)
+        const onVisibilityChange = () => {
+          clearInterval(timer)
+          timer = null
+          if (typeof document !== 'undefined' && document.hidden) return
+          refreshStatus()
+          timer = setInterval(() => refreshStatus(), 30_000)
+        }
+        // 测试与 SSR 沙箱里 document 可能没有事件接口，先探测再注册。
+        const canListen = typeof document !== 'undefined' && typeof document.addEventListener === 'function'
+        if (canListen) document.addEventListener('visibilitychange', onVisibilityChange)
+        return () => {
+          if (timer !== null) clearInterval(timer)
+          if (canListen) document.removeEventListener('visibilitychange', onVisibilityChange)
+        }
       }, [])
 
       const onMouseEnter = () => {
@@ -375,7 +435,12 @@ window.__ModuleLoader__.load({
           },
           onClick: toggleOverlay,
         },
-        h('span', { className: color === T.ok ? 'oc-dot-live' : undefined, style: dotStyle(color) }),
+        h('span', {
+          // 呼吸动画只播一次：key 绑定 fetchedAt，新数据到达时换新节点重播一次，而不是无限循环。
+          key: color === T.ok ? `live-${st?.fetchedAt ?? 0}` : 'live',
+          className: color === T.ok ? 'oc-dot-live' : undefined,
+          style: dotStyle(color),
+        }),
         labelEl,
       )
 
@@ -402,6 +467,8 @@ window.__ModuleLoader__.load({
         'div',
         {
           className: 'oc-panel-enter oc-hover-card',
+          // 只读微卡是面板的视觉重复，对读屏隐藏，避免同一份数据播报两遍。
+          'aria-hidden': true,
           style: {
             position: 'absolute',
             left: 0,
@@ -443,8 +510,13 @@ window.__ModuleLoader__.load({
             ),
             h(
               'span',
-              { key: 'at', style: { marginLeft: 'auto', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums', flexShrink: 0 } },
-              st?.fetchedAt ? `上次同步 ${fmtClock(st.fetchedAt)}` : '尚未同步',
+              {
+                key: 'at',
+                // 相对时间更易读；绝对时刻保留在 title 里，需要精确对时再悬停查看。
+                title: st?.fetchedAt ? `上次同步 ${fmtClock(st.fetchedAt)}` : '尚未同步',
+                style: { marginLeft: 'auto', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums', flexShrink: 0 },
+              },
+              st?.fetchedAt ? `上次同步 ${fmtRelative(st.fetchedAt)}` : '尚未同步',
             ),
           ]),
           h(
@@ -475,8 +547,9 @@ window.__ModuleLoader__.load({
             ? null
             : h('div', { style: { height: '100%', width: `${clampPct(remaining)}%`, background: color, borderRadius: 2 } }),
         ),
-        h('span', { key: 'v', style: { minWidth: 30, textAlign: 'right', fontSize: 10, fontWeight: 600, color, fontVariantNumeric: 'tabular-nums' } }, remaining === null ? '—' : `${remaining}%`),
-        h('span', { key: 'r', style: { minWidth: 34, textAlign: 'right', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } }, w?.resetAt ? `↻ ${timeUntil(w.resetAt)}` : ''),
+        h('span', { key: 'v', style: { minWidth: 30, textAlign: 'right', fontSize: 10, fontWeight: 600, color, fontVariantNumeric: 'tabular-nums' } }, remaining === null ? '—' : pctText(remaining)),
+        // 倒计时用 ⏱ 区分刷新动作的 ↻，避免两个图标同义混淆。
+        h('span', { key: 'r', style: { minWidth: 34, textAlign: 'right', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } }, w?.resetAt ? `⏱ ${timeUntil(w.resetAt)}` : ''),
       ])
     }
 
@@ -490,19 +563,23 @@ window.__ModuleLoader__.load({
       }
 
       const windows = Array.isArray(st.windows) ? st.windows : []
-      const monthlyRemaining = monthlyRemainingOf(st)
-      const host = hostOf(st.config?.baseUrl)
+      // 头部只给判断性摘要（最紧张窗口），具体数字留给下方窗口行，避免同一数字说两遍。
+      const tightest = tightestWindow(st)
 
       return h('div', null, [
         h('div', { key: 'sum', style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
           h('span', { key: 'd', style: dotStyle(st.ok ? T.ok : T.err) }),
           h('span', { key: 't', style: { fontSize: 12, fontWeight: 600, color: T.label } }, st.ok ? 'OpenCode GO 已连接' : 'OpenCode GO 异常'),
-          host ? h('span', { key: 'h', style: { fontSize: 10, color: T.secondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, host) : null,
-          monthlyRemaining !== null
+          tightest
             ? h(
                 'span',
-                { key: 'm', style: { marginLeft: 'auto', fontSize: 11, fontWeight: 600, color: remainingColor(monthlyRemaining), fontVariantNumeric: 'tabular-nums', flexShrink: 0 } },
-                `月剩余 ${monthlyRemaining}%`,
+                {
+                  key: 'm',
+                  // host 只在面板标题行展示一次；这里不再重复。
+                  title: `最紧张窗口：${tightest.label ?? tightest.id ?? '—'}，剩余 ${pctText(tightest.remainingPct)}`,
+                  style: { marginLeft: 'auto', fontSize: 11, fontWeight: 600, color: remainingColor(tightest.remainingPct), fontVariantNumeric: 'tabular-nums', flexShrink: 0 },
+                },
+                `最紧张 ${tightest.shortLabel ?? tightest.label ?? '—'} ${pctText(tightest.remainingPct)}`,
               )
             : null,
         ].filter(Boolean)),
@@ -518,32 +595,48 @@ window.__ModuleLoader__.load({
         st.ok && !windows.length
           ? h('div', { key: 'empty', style: { fontSize: 11, color: T.secondary, marginTop: 10 } }, '暂无用量窗口数据')
           : null,
-        h(
-          'div',
-          { key: 'note', style: { fontSize: 10, color: T.secondary, marginTop: 6, lineHeight: '15px' } },
-          '上游 /v1/usage 仅提供百分比额度，界面不展示金额余额。',
-        ),
       ].filter(Boolean))
     }
 
-    /** 面板窗口行：已用 % + 剩余 % + 重置倒计时 + 进度条（按剩余额度着色）。 */
+    /**
+     * 面板窗口行：主百分比只显示剩余额度（进度条填充同源），「已用」降级到 aria-valuetext 与 title。
+     * 语义约定：条长 = 剩余额度占比，条色 = 剩余额度档位；不再同一行并列「已用 X% / 剩余 Y%」重复表达。
+     */
     function QuotaRow(props) {
       const w = props.window
       const used = w?.usedPct ?? null
       const remaining = w?.remainingPct ?? null
       const color = remainingColor(remaining)
+      const band = remainingBand(remaining)
       const statusText = w?.status && w.status !== 'ok' ? w.status : null
+      const detail = remaining === null ? '数据不可用' : `已用 ${pctText(used)} · 剩余 ${pctText(remaining)}`
       return h('div', { style: { marginBottom: 12 } }, [
         h('div', { key: 'meta', style: { display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 11, marginBottom: 4, fontVariantNumeric: 'tabular-nums' } }, [
           h('span', { key: 'l', style: { color: T.label, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.label ?? '—'),
-          h('span', { key: 'u', style: { marginLeft: 'auto', color: T.secondary, flexShrink: 0 } }, used === null ? '已用 —' : `已用 ${used}%`),
-          h('span', { key: 'r', style: { color, fontWeight: 600, flexShrink: 0 } }, remaining === null ? '剩余 —' : `剩余 ${remaining}%`),
-          w?.resetAt ? h('span', { key: 't', style: { color: T.secondary, flexShrink: 0 } }, `↻ ${timeUntil(w.resetAt)}`) : null,
+          h('span', { key: 'r', title: detail, style: { marginLeft: 'auto', color, fontWeight: 600, flexShrink: 0 } }, remaining === null ? '剩余 —' : `剩余 ${pctText(remaining)}`),
+          // 低额度除颜色外再给文字标记：色觉障碍与灰度截图里也能看出档位。
+          band
+            ? h(
+                'span',
+                { key: 'band', style: { color, flexShrink: 0, fontSize: 10, lineHeight: '14px', padding: '0 4px', borderRadius: 4, border: `1px solid ${color}` } },
+                `⚠ ${band}`,
+              )
+            : null,
+          // 倒计时用 ⏱ 区分刷新动作的 ↻，避免两个图标同义混淆。
+          w?.resetAt ? h('span', { key: 't', style: { color: T.secondary, flexShrink: 0 } }, `⏱ ${timeUntil(w.resetAt)}`) : null,
         ].filter(Boolean)),
         h(
           'div',
           {
             key: 'track',
+            // 进度条语义：aria-valuenow 取剩余额度，与条长、右侧主百分比同源。
+            role: 'progressbar',
+            'aria-label': `${w?.label ?? '用量窗口'}剩余额度`,
+            'aria-valuemin': 0,
+            'aria-valuemax': 100,
+            ...(remaining === null ? {} : { 'aria-valuenow': Math.round(clampPct(remaining)) }),
+            'aria-valuetext': remaining === null ? '数据不可用' : `剩余 ${pctText(remaining)}，已用 ${pctText(used)}${band ? `，${band}` : ''}`,
+            title: detail,
             style: {
               height: 6,
               borderRadius: 3,
@@ -662,6 +755,12 @@ window.__ModuleLoader__.load({
             ? h('button', { className: 'oc-btn', style: { ...btnBase, color: T.err, marginLeft: 'auto' }, disabled: saving, onClick: clearKey }, '清除')
             : null,
         ].filter(Boolean)),
+        // 数据口径说明放设置视图：用量视图保持只读结论，正文不再常驻免责声明。
+        h(
+          'div',
+          { key: 'note', style: { fontSize: 10, color: T.secondary, marginTop: 14, lineHeight: '15px' } },
+          '上游 /v1/usage 仅提供百分比额度，界面不展示金额余额。',
+        ),
       ])
     }
 
@@ -669,7 +768,17 @@ window.__ModuleLoader__.load({
     function OpsBar(props) {
       const state = useStore()
       const st = state.status
-      const lastSync = st?.fetchedAt ? fmtClock(st.fetchedAt) : null
+      // 相对时间更好读；绝对时刻保留在 title，同步超过 2 分钟再给弱过期提示。
+      const lastSync = st?.fetchedAt ? fmtRelative(st.fetchedAt) : null
+      const lastSyncTitle = st?.fetchedAt ? `上次同步 ${fmtClock(st.fetchedAt)}` : '尚未同步'
+      const lastSyncStale = Boolean(st?.fetchedAt) && Date.now() - st.fetchedAt > STALE_AFTER_MS
+      const syncText = lastSync ? `上次同步 ${lastSync}${lastSyncStale ? ' · 可能已过期' : ''}` : '尚未同步'
+      const syncSpan = (key, extraStyle) =>
+        h(
+          'span',
+          { key, title: lastSyncTitle, style: { ...extraStyle, fontVariantNumeric: 'tabular-nums' } },
+          syncText,
+        )
 
       if (props?.settings) {
         return h('div', { style: barStyle }, [
@@ -688,11 +797,7 @@ window.__ModuleLoader__.load({
                 '← 返回用量',
               )
             : null,
-          h(
-            'span',
-            { style: { marginLeft: 'auto', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } },
-            lastSync ? `上次同步 ${lastSync}` : '尚未同步',
-          ),
+          syncSpan('at', { marginLeft: 'auto', fontSize: 10, color: T.secondary }),
         ].filter(Boolean))
       }
 
@@ -713,11 +818,7 @@ window.__ModuleLoader__.load({
             state.refreshing ? '刷新中…' : '刷新',
           ),
           h('button', { key: 'set', className: 'oc-btn', style: btnBase, onClick: openSettings, title: '配置 Base URL 与 API Key' }, '⚙ 设置'),
-          h(
-            'span',
-            { key: 'at', style: { marginLeft: 'auto', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } },
-            lastSync ? `上次同步 ${lastSync}` : '尚未同步',
-          ),
+          syncSpan('at', { marginLeft: 'auto', fontSize: 10, color: lastSyncStale ? T.warn : T.secondary }),
         ],
       )
     }
@@ -761,6 +862,52 @@ window.__ModuleLoader__.load({
         return () => window.removeEventListener('mousedown', handleClickOutside)
       }, [state.open])
 
+      // Esc 关闭：与面板同开同卸载；Tab 焦点保持在面板内，避免键盘用户掉到背后的不可见区域。
+      useEffect(() => {
+        if (!state.open) return
+        const handleKeyDown = (e) => {
+          if (e.key === 'Escape') {
+            e.stopPropagation()
+            closeOverlay()
+            return
+          }
+          if (e.key !== 'Tab' || !panelRef.current || typeof panelRef.current.querySelectorAll !== 'function') return
+          const focusables = [...panelRef.current.querySelectorAll(FOCUSABLE)]
+          if (!focusables.length) {
+            e.preventDefault()
+            panelRef.current.focus()
+            return
+          }
+          const first = focusables[0]
+          const last = focusables[focusables.length - 1]
+          if (e.shiftKey && (e.target === first || e.target === panelRef.current)) {
+            e.preventDefault()
+            last.focus()
+          } else if (!e.shiftKey && e.target === last) {
+            e.preventDefault()
+            first.focus()
+          }
+        }
+        window.addEventListener('keydown', handleKeyDown)
+        return () => window.removeEventListener('keydown', handleKeyDown)
+      }, [state.open])
+
+      // 焦点管理：打开时移入面板（容器 tabIndex=-1），关闭时归还打开前的触发元素（footer 按钮）。
+      useEffect(() => {
+        if (!state.open) return
+        if (typeof document === 'undefined') return
+        const previous = document.activeElement
+        const panel = panelRef.current
+        if (panel && typeof panel.focus === 'function') panel.focus()
+        return () => {
+          if (!previous || typeof previous.focus !== 'function') return
+          // 只把焦点从面板（或已失焦的 body）收回触发按钮：点击外部关闭时不要抢走用户刚点中的控件焦点。
+          const active = document.activeElement
+          if (active && active !== document.body && typeof panel?.contains === 'function' && !panel.contains(active)) return
+          previous.focus()
+        }
+      }, [state.open])
+
       if (phase === 'closed') return null
 
       const st = state.status
@@ -772,11 +919,18 @@ window.__ModuleLoader__.load({
         {
           ref: panelRef,
           className: phase === 'closing' ? 'oc-panel-exit' : 'oc-panel-enter',
+          // 非模态对话框：允许点击外部关闭，因此不声明 aria-modal（WAI-ARIA 要求 aria-modal=true 时外部内容不可交互）。
+          role: 'dialog',
+          'aria-label': settingsView ? 'OpenCode GO 连接配置' : 'OpenCode GO 用量',
+          tabIndex: -1,
           style: {
             position: 'fixed',
             left: 12,
             bottom: 52,
-            width: 360,
+            // 窄视口（<384px）不再右侧溢出：宽度随视口收缩，border-box 让 1px 边框不额外撑宽。
+            width: 'min(360px, calc(100vw - 24px))',
+            maxWidth: 'calc(100vw - 24px)',
+            boxSizing: 'border-box',
             maxHeight: 'calc(100vh - 80px)',
             overflow: 'hidden',
             display: 'flex',
@@ -804,6 +958,7 @@ window.__ModuleLoader__.load({
                 style: { ...btnBase, marginLeft: 'auto', border: 'none', padding: '2px 6px' },
                 onClick: closeOverlay,
                 title: '关闭',
+                'aria-label': '关闭面板',
               },
               '✕',
             ),
