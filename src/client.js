@@ -176,17 +176,164 @@ window.__ModuleLoader__.load({
     const ETA_MAX_SAMPLES = 120
     const ETA_MIN_SAMPLES = 3
     const ETA_MIN_SPAN_MS = 10 * 60_000
+    // 持久化键与版本：v2 起带账号归属（baseUrl + 可选 keyHint）。
+    const ETA_SAMPLES_STORAGE_KEY = 'dsh-opencode-status.eta-samples'
+    const ETA_SAMPLES_STORAGE_VERSION = 2
 
     /** windowId -> { resetAt, samples: [{ at, used }] }；at 取 status.fetchedAt（不是 Date.now）。 */
     const etaSamples = new Map()
 
     /**
-     * 记录一次成功刷新的样本：按窗口分组，用 fetchedAt 去重（宿主 30s 缓存会让多次轮询拿到同一个时间），
-     * usedPct 回落或 resetsAt 变化说明窗口已重置，立即清空该窗口历史重新采样，避免算出负数或荒谬 ETA。
+     * 采样归属身份：baseUrl 必有（status.config.baseUrl / config.baseUrl），apiKeyHint 取自
+     * GET /api/opencode-status/config 的 apiKey.hint（只含末四位的掩码，不是密钥本身），可能拿不到。
+     * 持久化按身份隔离，判据遵循「缺证据不下结论」：baseUrl 不同才确凿丢弃；hint 只有双方都存在
+     * 且不同才确凿丢弃；任一方 hint 缺失（例如 status 先到、config 后到）退回只按 baseUrl 隔离，保留历史。
+     * 已知限制：同一 baseUrl 下换账号、且拿不到 hint（hint 为空）时无法识别，旧样本会被复用；
+     * 此时只按 baseUrl 隔离——宁可暂时不分账号，也不能误删同账号数据。
+     */
+    const etaIdentity = { baseUrl: null, keyHint: null }
+    let etaRestorePayload = null
+    let etaRestoreSettled = false
+    // 恢复时持久化里记录的 hint：首轮拿不到 hint（只按 baseUrl 恢复）时，用它在 hint 晚到后补一次账号校验。
+    let etaRestoredKeyHint = null
+
+    /** 读取持久化原文但先不恢复：身份要等首个 status/config 响应才知道，不能盲信旧账号样本。 */
+    function readEtaSamplesPayload() {
+      try {
+        if (typeof localStorage === 'undefined' || !localStorage) {
+          etaRestoreSettled = true
+          return
+        }
+        const raw = localStorage.getItem(ETA_SAMPLES_STORAGE_KEY)
+        if (!raw) {
+          etaRestoreSettled = true
+          return
+        }
+        const parsed = JSON.parse(raw)
+        // 旧版 v1 没有账号归属，无法校验是否同一账号：整体丢弃，不做部分恢复。
+        if (!parsed || parsed.v !== ETA_SAMPLES_STORAGE_VERSION || typeof parsed.baseUrl !== 'string' || !parsed.baseUrl) {
+          etaRestoreSettled = true
+          return
+        }
+        etaRestorePayload = parsed
+      } catch {
+        etaRestoreSettled = true
+      }
+    }
+
+    /** 判断持久化样本是否属于当前账号：baseUrl 必须一致；双方都有 hint 且不同才判为不同账号。 */
+    function etaIdentityMatches(payload) {
+      if (!etaIdentity.baseUrl || payload?.baseUrl !== etaIdentity.baseUrl) return false
+      const storedHint = typeof payload.keyHint === 'string' && payload.keyHint ? payload.keyHint : null
+      if (storedHint && etaIdentity.keyHint && storedHint !== etaIdentity.keyHint) return false
+      return true
+    }
+
+    /**
+     * 首次拿到 baseUrl 后恢复持久化样本：只保留最近 60 分钟、每窗口最多 120 个样本、按 fetchedAt 去重。
+     * 身份不匹配（或旧版无身份）时整体丢弃，绝不部分恢复；存储不可用/损坏时静默降级为空历史。
+     */
+    function restoreEtaSamples() {
+      if (etaRestoreSettled || !etaIdentity.baseUrl) return
+      etaRestoreSettled = true
+      const payload = etaRestorePayload
+      etaRestorePayload = null
+      etaRestoredKeyHint = null
+      if (!payload || !etaIdentityMatches(payload)) {
+        // 不是当前账号的历史：清掉，避免换账号/换 baseUrl 后混用出看似正常的错误估算。
+        if (payload) {
+          try {
+            if (typeof localStorage !== 'undefined' && localStorage) localStorage.removeItem(ETA_SAMPLES_STORAGE_KEY)
+          } catch {}
+        }
+        return
+      }
+      etaRestoredKeyHint = typeof payload.keyHint === 'string' && payload.keyHint ? payload.keyHint : null
+      try {
+        const storedWindows = payload.windows
+        if (!storedWindows || typeof storedWindows !== 'object' || Array.isArray(storedWindows)) return
+        const cutoff = Date.now() - ETA_SAMPLE_WINDOW_MS
+        for (const [id, stored] of Object.entries(storedWindows)) {
+          if (typeof id !== 'string' || !id) continue
+          const rows = Array.isArray(stored?.samples) ? stored.samples : []
+          // 同一 fetchedAt 只留一条（与运行时去重口径一致，后写入值覆盖）。
+          const byAt = new Map()
+          for (const row of rows) {
+            if (typeof row?.at !== 'number' || !Number.isFinite(row.at)) continue
+            if (typeof row?.used !== 'number' || !Number.isFinite(row.used)) continue
+            byAt.set(row.at, { at: row.at, used: row.used })
+          }
+          const samples = [...byAt.values()].filter((s) => s.at >= cutoff).sort((a, b) => a.at - b.at)
+          if (!samples.length) continue
+          const resetAt = typeof stored?.resetAt === 'number' && Number.isFinite(stored.resetAt) ? stored.resetAt : null
+          etaSamples.set(id, { resetAt, samples: samples.slice(-ETA_MAX_SAMPLES) })
+        }
+      } catch {}
+    }
+
+    /**
+     * 记录当前账号身份（baseUrl 必有、keyHint 可选）：身份变化说明换了 baseUrl/账号，
+     * 旧历史必须整体作废，否则两个账号的 usedPct 会拼出错误速率（例如旧账号 10→20 + 新账号 50）。
+     */
+    function noteEtaIdentity(baseUrl, keyHint) {
+      let changed = false
+      if (typeof baseUrl === 'string' && baseUrl && baseUrl !== etaIdentity.baseUrl) {
+        if (etaIdentity.baseUrl) changed = true
+        etaIdentity.baseUrl = baseUrl
+      }
+      if (typeof keyHint === 'string' && keyHint && keyHint !== etaIdentity.keyHint) {
+        // status 与 config 是两个请求，config.hint 天然可能晚到（此时 etaIdentity.keyHint 为 null）。
+        // 只有「已知 hint 与本次 hint 都确凿存在且不同」才能判定换了账号；缺证据一律不下结论，
+        // 否则同一账号在 status 先到、config 后到时会被误判并清空刚恢复的持久化历史。
+        const knownHint = etaIdentity.keyHint ?? etaRestoredKeyHint
+        if (knownHint && keyHint !== knownHint) changed = true
+        // 同 hint 晚到只补写身份，不清空历史。
+        etaIdentity.keyHint = keyHint
+      }
+      if (changed) {
+        etaSamples.clear()
+        etaRestoredKeyHint = null
+        persistEtaSamples()
+      }
+      restoreEtaSamples()
+    }
+
+    /** 把采样写回 localStorage：带 baseUrl/keyHint 归属；只含窗口 id、fetchedAt 与用量百分比，不写密钥或凭证。 */
+    function persistEtaSamples() {
+      try {
+        if (typeof localStorage === 'undefined' || !localStorage) return
+        if (!etaIdentity.baseUrl) return // 身份未知不落盘，避免无法校验归属的历史
+        const windows = {}
+        for (const [id, entry] of etaSamples) {
+          if (!entry.samples.length) continue
+          windows[id] = {
+            resetAt: entry.resetAt,
+            samples: entry.samples.map(({ at, used }) => ({ at, used })),
+          }
+        }
+        localStorage.setItem(ETA_SAMPLES_STORAGE_KEY, JSON.stringify({
+          v: ETA_SAMPLES_STORAGE_VERSION,
+          baseUrl: etaIdentity.baseUrl,
+          keyHint: etaIdentity.keyHint,
+          windows,
+        }))
+      } catch {}
+    }
+
+    /**
+     * 记录一次成功刷新的样本：按窗口分组，用 fetchedAt 去重（宿主 30s 缓存会让多次轮询拿到同一个时间）。
+     * 清空判据的前提：同一窗口内上游 usedPct 单调不减（percent 由窗口内累计用量换算，只增不减）；
+     * 只有 usedPct 真实回落（used < last.used）才说明窗口已重置、需要清空历史。
+     * 已知漏检：窗口重置恰好发生在两次轮询之间、且新窗口用量已超过旧值（例如 5 → 0 → 6）时不会清空，
+     * 历史会跨重置累积；0 → 0 的次 1% 重置也无法检测。这是有意的取舍：不能改用 resetAt 兜底——
+     * 滚动 5h 是滑动窗口，resetAt 会随早先用量过期不断前移，把它当重置信号正是「永远采样中」的根因。
      */
     function recordSamples(status) {
+      // 先用响应里的 baseUrl 确认账号归属：换账号后旧样本必须整体作废，不能混用两个账号的 usedPct。
+      noteEtaIdentity(status?.config?.baseUrl, null)
       if (!status?.ok || typeof status.fetchedAt !== 'number') return
       const windows = Array.isArray(status.windows) ? status.windows : []
+      let changed = false
       for (const w of windows) {
         const id = w?.id
         if (!id || typeof w?.usedPct !== 'number') continue
@@ -200,15 +347,21 @@ window.__ModuleLoader__.load({
         }
         const last = entry.samples[entry.samples.length - 1]
         if (last && last.at === at) continue // 同一份缓存数据不重复采样
-        if (last && (used < last.used || resetAt !== entry.resetAt)) entry.samples = []
+        // resetAt 变化只更新基准（下面统一赋值），不清历史；只有用量真实回落才是窗口重置。
+        if (last && used < last.used) entry.samples = []
         entry.resetAt = resetAt
         entry.samples.push({ at, used })
+        changed = true
         // 只保留最近 60 分钟、每窗口最多 120 个样本。
         const cutoff = at - ETA_SAMPLE_WINDOW_MS
         while (entry.samples.length && entry.samples[0].at < cutoff) entry.samples.shift()
         if (entry.samples.length > ETA_MAX_SAMPLES) entry.samples.splice(0, entry.samples.length - ETA_MAX_SAMPLES)
       }
+      if (changed) persistEtaSamples()
     }
+
+    // 模块加载时先读持久化原文；身份要等首个 status/config 响应，确认同账号后才恢复历史。
+    readEtaSamplesPayload()
 
     /**
      * 估算「按当前速率还能撑多久」。样本 ≥3、首尾跨度 ≥10 分钟、速率 >0 三者缺一即返回 null；
@@ -302,9 +455,15 @@ window.__ModuleLoader__.load({
       return entry ? entry.samples.map((s) => ({ ...s })) : []
     }
 
-    /** 仅供测试与诊断：清空所有采样。 */
+    /** 仅供测试与诊断：清空所有采样（含持久化副本），并阻止本次生命周期内再从存储恢复。 */
     function resetEtaSamples() {
       etaSamples.clear()
+      etaRestorePayload = null
+      etaRestoreSettled = true
+      etaRestoredKeyHint = null
+      try {
+        if (typeof localStorage !== 'undefined' && localStorage) localStorage.removeItem(ETA_SAMPLES_STORAGE_KEY)
+      } catch {}
     }
 
     /** 月窗口剩余百分比；上游只给百分比，不存在金额余额。 */
@@ -389,8 +548,68 @@ window.__ModuleLoader__.load({
     async function refreshConfig() {
       try {
         const config = await api('/api/opencode-status/config')
+        // config.apiKey.hint 是「••••末四位」掩码（不是密钥），用来判断持久化样本是否同一账号。
+        noteEtaIdentity(config?.baseUrl, config?.apiKey?.hint)
         store.set({ config })
       } catch {}
+    }
+
+    // 30 秒状态轮询是模块级单例：采样服务于面板，不能依赖 footer 组件是否挂载。
+    let statusPollingStarted = false
+    let statusPollTimer = null
+    let visibilityListenerBound = false
+
+    /**
+     * 页面恢复可见时立即补拉一次；隐藏期间保留 ticker（浏览器会自行节流后台定时器）。
+     * 旧实现 hidden 时 clearInterval，恢复只靠这一次 visibilitychange——事件一旦丢失，
+     * 采样就永久停摆，面板只能停在 1-2 个样本的「采样中」。
+     */
+    function onVisibilityChange() {
+      if (typeof document !== 'undefined' && document.hidden) return
+      refreshStatus()
+    }
+
+    /**
+     * 幂等释放轮询与可见性监听：插件 dispose / HMR 重载时由 apply 的 ctx.effect 调用。
+     * 不释放的话旧 ticker 会随模块退役继续存活，新旧 ticker 并存时每 30 秒发两次请求。
+     */
+    function disposeStatusPolling() {
+      if (statusPollTimer !== null) {
+        clearInterval(statusPollTimer)
+        statusPollTimer = null
+      }
+      statusPollingStarted = false
+      if (visibilityListenerBound) {
+        visibilityListenerBound = false
+        if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+          document.removeEventListener('visibilitychange', onVisibilityChange)
+        }
+      }
+    }
+
+    /**
+     * 安装 30 秒 GET 轮询（幂等），返回同一个幂等 disposer。旧实现在 FooterEntry 的挂载 effect 里建 ticker：
+     * footer 卸载（侧栏收起、布局切换）或 hidden 清理后事件丢失，采样永久停止，
+     * 面板只剩 1-2 个内存样本，于是永远「采样中」。轮询属于模块级资源，组件卸载不拆除，
+     * 但插件 dispose 时必须释放（见 disposeStatusPolling）。
+     */
+    function ensureStatusPolling() {
+      if (!statusPollingStarted) {
+        statusPollingStarted = true
+        statusPollTimer = setInterval(() => refreshStatus(), 30_000)
+        // 首次安装立即拉一次，面板不用等第一个 30 秒。
+        refreshStatus()
+      }
+      if (!visibilityListenerBound) {
+        // 测试与 SSR 沙箱里 document 可能没有事件接口，先探测再注册。
+        const canListen = typeof document !== 'undefined' && typeof document.addEventListener === 'function'
+        if (canListen) {
+          document.addEventListener('visibilitychange', onVisibilityChange)
+          visibilityListenerBound = true
+        }
+      }
+      // 多次 ensure 返回同一个函数引用：FooterEntry 的幂等调用不会造出第二个 disposer。
+      return disposeStatusPolling
     }
 
     /** 手动刷新唯一入口：绕过 30 秒缓存，强制重新拉取当前剩余额度。 */
@@ -442,23 +661,9 @@ window.__ModuleLoader__.load({
       const hoverTimerRef = useRef(null)
 
       useEffect(() => {
-        refreshStatus()
-        // 30 秒 GET 自动刷新；页面隐藏时暂停轮询，恢复可见时立即补拉一次，避免后台空转探测上游。
-        let timer = setInterval(() => refreshStatus(), 30_000)
-        const onVisibilityChange = () => {
-          clearInterval(timer)
-          timer = null
-          if (typeof document !== 'undefined' && document.hidden) return
-          refreshStatus()
-          timer = setInterval(() => refreshStatus(), 30_000)
-        }
-        // 测试与 SSR 沙箱里 document 可能没有事件接口，先探测再注册。
-        const canListen = typeof document !== 'undefined' && typeof document.addEventListener === 'function'
-        if (canListen) document.addEventListener('visibilitychange', onVisibilityChange)
-        return () => {
-          if (timer !== null) clearInterval(timer)
-          if (canListen) document.removeEventListener('visibilitychange', onVisibilityChange)
-        }
+        // 只幂等确保 ticker 存在，不接管清理：ticker 的生命周期归 apply 的 ctx.effect 管理。
+        // footer 卸载（侧栏收起、布局切换）不得停采，这里也不能创建第二个 disposer 去重复清理。
+        ensureStatusPolling()
       }, [])
 
       // 卸载时清掉待触发的悬停定时器，避免 220ms 后对已卸载组件 setState。
@@ -846,7 +1051,8 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ baseUrl, ...(apiKey ? { apiKey } : {}) }),
           })
-          // 保存成功后回到用量视图
+          // 保存成功后回到用量视图；账号/baseUrl 变了就立刻作废旧账号的采样历史，不等下一次轮询。
+          noteEtaIdentity(result.config?.baseUrl ?? result.status?.config?.baseUrl, result.config?.apiKey?.hint)
           store.set({ status: result.status, config: result.config, view: 'status', error: null })
           setApiKey('')
         } catch (e) {
@@ -866,6 +1072,7 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ baseUrl, clearApiKey: true }),
           })
+          noteEtaIdentity(result.config?.baseUrl ?? result.status?.config?.baseUrl, result.config?.apiKey?.hint)
           store.set({ status: result.status, config: result.config, error: null })
         } catch (e) {
           setError(e?.message ?? '清除失败')
@@ -1138,6 +1345,9 @@ window.__ModuleLoader__.load({
 
     // ---------- 注册 ----------
     function apply(ctx) {
+      // 轮询与 visibilitychange 监听随插件生命周期释放：不依赖 footer 是否挂载（侧栏收起/布局切换仍持续采样），
+      // 但 dispose/HMR 时必须清掉，否则旧 ticker 会和新 ticker 并存、每 30 秒发两次请求。
+      ctx.effect(() => ensureStatusPolling())
       ctx.effect(() => {
         const el = document.createElement('style')
         el.id = 'dsh-opencode-status-styles'
@@ -1160,7 +1370,7 @@ window.__ModuleLoader__.load({
     exports.apply = apply
     exports.inject = ['slots']
     // 仅供测试与诊断：估算/采样是纯函数 + 模块内状态，导出以便做真实单元测试（宿主侧不消费）。
-    exports.__internal = { estimateEta, recordSamples, getSamples, resetEtaSamples, fmtEtaDuration, coarsenEta, etaView }
+    exports.__internal = { estimateEta, recordSamples, getSamples, resetEtaSamples, fmtEtaDuration, coarsenEta, etaView, ensureStatusPolling, noteEtaIdentity }
     return module.exports
   },
 })

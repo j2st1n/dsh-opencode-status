@@ -826,14 +826,176 @@ test('P1 信息设计：相对时间/过期提示、单一主百分比、免责�
   assert.doesNotMatch(text, /oc-dot-live \{ animation: ocPulse[^}]*infinite/)
 })
 
-test('轮询在 document.hidden 时暂停、恢复可见立即补拉，间隔仍为 30s（P1）', () => {
-  const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
-  // 30 秒 GET 自动刷新保持不变（宿主缓存 TTL 也是 30s）
-  assert.match(text, /setInterval\(\(\) => refreshStatus\(\), 30_000\)/)
-  assert.match(text, /const onVisibilityChange = \(\) => \{[\s\S]{0,260}refreshStatus\(\)[\s\S]{0,120}setInterval\(\(\) => refreshStatus\(\), 30_000\)/)
-  assert.match(text, /document\.hidden/)
-  assert.match(text, /typeof document\.addEventListener === 'function'/)
-  assert.match(text, /removeEventListener\('visibilitychange', onVisibilityChange\)/)
+/** 构建带可控定时器 / 可见性事件 / document 事件的插件运行时，用于验证模块级轮询。 */
+function loadPollingRuntime(options = {}) {
+  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  const state = { open: false, view: 'status', status: null, config: null, refreshing: false, error: null }
+  const intervals = new Map()
+  const cleared = []
+  const listeners = new Map()
+  const fetches = []
+  const effects = []
+  const effectCleanups = []
+  let nextTimer = 1
+  let plugin = null
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity).filter((c) => c != null) }),
+    useEffect: (fn) => effects.push(fn),
+    useState: (value) => [value, () => {}],
+    useRef: (value) => ({ current: value }),
+    useSyncExternalStore: () => state,
+  }
+  const documentMock = {
+    hidden: false,
+    createElement: () => ({ remove() {} }),
+    head: { appendChild() {} },
+    addEventListener: (type, fn) => listeners.set(type, fn),
+    removeEventListener: (type, fn) => listeners.delete(type),
+  }
+  const sandbox = {
+    window: {
+      __ModuleLoader__: {
+        load: (definition) => {
+          plugin = definition.factory((name) => {
+            if (name === 'react') return React
+            throw new Error(`unexpected require: ${name}`)
+          })
+        },
+      },
+    },
+    document: documentMock,
+    fetch: async (url) => {
+      fetches.push(String(url))
+      return options.fetch ? options.fetch(String(url)) : { ok: true, json: async () => ({}) }
+    },
+    setInterval: (fn, ms) => {
+      const id = nextTimer++
+      intervals.set(id, { fn, ms })
+      return id
+    },
+    clearInterval: (id) => {
+      cleared.push(id)
+      intervals.delete(id)
+    },
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    // 可选注入 localStorage（账号隔离的真实路径用例用）；默认不注入。
+    ...(options.localStorage ? { localStorage: options.localStorage } : {}),
+  }
+  vm.createContext(sandbox)
+  vm.runInContext(source, sandbox, { filename: 'client.js' })
+  const registered = []
+  const slots = {
+    inject: (name, factory) => factory(),
+    register: (meta, component) => {
+      registered.push(component)
+      return () => {}
+    },
+  }
+  /** 执行一次 apply：保存 ctx.effect 注册的 cleanup，供「插件 dispose」用例真正触发。 */
+  const applyPlugin = () => {
+    plugin.apply({
+      effect: (factory) => {
+        const cleanup = factory()
+        if (typeof cleanup === 'function') effectCleanups.push(cleanup)
+        return cleanup
+      },
+      slots,
+    })
+  }
+  applyPlugin()
+  /** 最小函数组件渲染器：真正执行组件函数体，useEffect 才会被收集（否则卸载断言会空跑）。 */
+  const render = (element) => {
+    if (element == null || element === false || typeof element !== 'object') return element
+    if (Array.isArray(element)) return element.map(render)
+    if (typeof element.type === 'function') return render(element.type(element.props))
+    return { ...element, children: element.children.map(render) }
+  }
+  /** 执行组件挂载时收集到的 effect，返回 cleanup 列表。 */
+  const runComponentEffects = () => {
+    const pending = effects.splice(0)
+    return pending.map((fn) => fn())
+  }
+  /** 执行 apply 注册的全部 cleanup，模拟插件 dispose / HMR 卸载。 */
+  const disposePlugin = () => {
+    for (const cleanup of effectCleanups.splice(0).reverse()) cleanup()
+  }
+  return { plugin, state, document: documentMock, intervals, cleared, listeners, fetches, registered, render, runComponentEffects, disposePlugin, applyPlugin }
+}
+
+test('轮询：模块级幂等 ticker，组件卸载不停摆、插件 dispose 释放，恢复可见立即补拉（P0/F1/F3）', async () => {
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  const app = loadPollingRuntime()
+  // apply 即安装唯一 ticker（30s）并立即补拉一次
+  assert.equal(app.intervals.size, 1)
+  assert.equal([...app.intervals.values()][0].ms, 30_000)
+  assert.equal(app.listeners.size, 1)
+  await flush()
+  assert.equal(app.fetches.length, 1)
+
+  // 真正渲染 footer（执行组件函数体与 useEffect）：effect 再 ensure 一次是幂等的，不新开 ticker、不重复发请求
+  app.render(app.registered[0]({ wide: true }))
+  const componentCleanups = app.runComponentEffects()
+  assert.ok(componentCleanups.length >= 2, 'footer effect 必须真的执行到（防止卸载断言空跑）')
+  assert.equal(app.intervals.size, 1)
+  assert.equal(app.fetches.length, 1)
+  // 组件卸载：cleanup 不得拆除模块级 ticker（旧实现正是在这里停掉采样）
+  for (const cleanup of componentCleanups) if (typeof cleanup === 'function') cleanup()
+  assert.equal(app.intervals.size, 1)
+  assert.equal(app.listeners.size, 1)
+  assert.equal(app.cleared.length, 0)
+
+  // 页面隐藏：不再 clearInterval（交给浏览器节流），也不立即补拉
+  app.document.hidden = true
+  app.listeners.get('visibilitychange')()
+  await flush()
+  assert.equal(app.intervals.size, 1)
+  assert.equal(app.cleared.length, 0)
+  assert.equal(app.fetches.length, 1)
+
+  // 恢复可见：立即补拉一次，复用原 ticker
+  app.document.hidden = false
+  app.listeners.get('visibilitychange')()
+  await flush()
+  assert.equal(app.intervals.size, 1)
+  assert.equal(app.cleared.length, 0)
+  assert.equal(app.fetches.length, 2)
+
+  // ticker 到点仍会继续采样
+  ;[...app.intervals.values()][0].fn()
+  await flush()
+  assert.equal(app.fetches.length, 3)
+
+  // 重复 ensure（重新挂载）仍然只有一个 ticker、一个可见性监听
+  app.plugin.__internal.ensureStatusPolling()
+  app.plugin.__internal.ensureStatusPolling()
+  assert.equal(app.intervals.size, 1)
+  assert.equal(app.listeners.size, 1)
+  assert.equal(app.cleared.length, 0)
+
+  // 插件 dispose / HMR 卸载：timer 与 visibilitychange 监听必须随 ctx.effect cleanup 释放
+  const timerId = [...app.intervals.keys()][0]
+  app.disposePlugin()
+  assert.equal(app.intervals.size, 0, 'dispose 后不得遗留 ticker')
+  assert.equal(app.cleared.includes(timerId), true, 'dispose 必须 clearInterval 掉本插件安装的 ticker')
+  assert.equal(app.listeners.size, 0, 'dispose 后不得遗留 visibilitychange 监听')
+  // 监听已移除：再触发可见性事件不会补拉
+  app.document.hidden = false
+  assert.equal(app.fetches.length, 3)
+
+  // HMR 重新 apply：新旧不会并存，只安装一个 ticker
+  app.applyPlugin()
+  assert.equal(app.intervals.size, 1)
+  assert.equal(app.listeners.size, 1)
+
+  // 幂等 disposer：多次 ensure 返回同一个函数引用，重复调用只清理一次
+  const disposeA = app.plugin.__internal.ensureStatusPolling()
+  const disposeB = app.plugin.__internal.ensureStatusPolling()
+  assert.equal(disposeA, disposeB, 'ensureStatusPolling 必须返回同一个 disposer')
+  disposeA()
+  disposeA()
+  assert.equal(app.intervals.size, 0)
+  assert.equal(app.listeners.size, 0)
 })
 
 test('上游小数与越界百分比被取整并钳制到 0–100（P0）', async () => {
@@ -1377,7 +1539,7 @@ test('真实浏览器形态经 loopback、localhost、bind 地址与 trustedHost
 // ---------- 消耗速率估算（t10）：纯函数 + 采样状态，全部用真实运行时断言 ----------
 
 /** 加载 client.js 到 vm 沙箱，返回插件导出（含 __internal 中的估算/采样函数）。 */
-function loadClientForUnit() {
+function loadClientForUnit(extraGlobals = {}) {
   const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
   const React = {
     createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity).filter((c) => c != null) }),
@@ -1404,6 +1566,8 @@ function loadClientForUnit() {
     clearInterval: () => {},
     setTimeout: () => 0,
     clearTimeout: () => {},
+    // 可选注入 localStorage 等额外全局（持久化用例用）；默认不注入，覆盖沙箱无存储的降级路径。
+    ...extraGlobals,
   }
   vm.createContext(sandbox)
   vm.runInContext(source, sandbox, { filename: 'client.js' })
@@ -1537,7 +1701,7 @@ test('估算纯函数：ETA 短于重置标记耗尽，长于重置标记可支�
   assert.equal(fmtEtaDuration(26 * 60 * min), '1d2h')
 })
 
-test('采样：按 fetchedAt 去重、按窗口分组，used 回落或 resetsAt 变化清空该窗口历史', () => {
+test('采样：按 fetchedAt 去重、按窗口分组，used 回落才清空历史（resetsAt 前移不清空）', () => {
   const { recordSamples, getSamples, resetEtaSamples } = loadClientForUnit().__internal
   resetEtaSamples()
   const t0 = 1_700_000_000_000
@@ -1565,15 +1729,15 @@ test('采样：按 fetchedAt 去重、按窗口分组，used 回落或 resetsAt 
   recordSamples(status(t0 + 120_000, 3, 2))
   assert.deepEqual(pairs('rolling'), [[t0 + 120_000, 3]])
   assert.equal(getSamples('weekly').length, 3)
-  // resetsAt 变化（即使 used 继续增长）→ 同样清空该窗口历史
+  // resetsAt 前移（滚动窗口随早先用量的过期而前移）不是重置：即使 used 继续增长，历史也必须继续累积
   recordSamples(status(t0 + 180_000, 4, 3, resetAt + 86_400_000))
-  assert.deepEqual(pairs('rolling'), [[t0 + 180_000, 4]])
-  // weekly 的 resetsAt 没变，历史继续累积（不受 rolling 重置影响）
+  assert.deepEqual(pairs('rolling'), [[t0 + 120_000, 3], [t0 + 180_000, 4]])
+  // weekly 的历史同样继续累积，不受 rolling 的 resetsAt 变化影响
   assert.equal(getSamples('weekly').length, 4)
   // 失败状态（ok:false / 无 fetchedAt）不采样
   recordSamples({ ok: false, fetchedAt: t0 + 240_000, windows: [] })
   recordSamples({ ok: true, windows: [] })
-  assert.equal(getSamples('rolling').length, 1)
+  assert.equal(getSamples('rolling').length, 2)
   // 未成功过的窗口读取为空
   assert.equal(getSamples('monthly').length, 0)
 })
@@ -1601,6 +1765,352 @@ test('采样裁剪：每窗口最多 120 个样本，且只保留最近 60 分�
   const pruned = getSamples('rolling')
   assert.equal(pruned.length, 1)
   assert.equal(pruned[0].used, 200)
+})
+
+test('采样回归：resetAt 每次前移且 usedPct 单调不降时，样本持续累积并算出估算（P0）', () => {
+  const { recordSamples, getSamples, resetEtaSamples, estimateEta, etaView } = loadClientForUnit().__internal
+  resetEtaSamples()
+  const now = Date.now()
+  const min = 60_000
+  const resetAt = now + 2 * 3_600_000
+  const start = now - 10 * min
+  // 21 个 30s 样本（跨度正好 10 分钟）；resetAt 每次前移 30s，模拟滚动窗口随早先用量过期而滑动
+  for (let i = 0; i < 21; i += 1) {
+    recordSamples({
+      ok: true,
+      fetchedAt: start + i * 30_000,
+      windows: [{
+        id: 'rolling',
+        usedPct: i,
+        remainingPct: 100 - i,
+        resetAt: resetAt + i * 30_000,
+      }],
+    })
+  }
+  const samples = getSamples('rolling')
+  assert.equal(samples.length, 21, 'resetAt 前移不得清空采样历史')
+  const estimate = estimateEta(samples, 50, resetAt)
+  assert.ok(estimate, '跨度已满 10 分钟且速率 >0，应能算出估算')
+  assert.equal(estimate.spanMs, 10 * min)
+  const view = etaView({ id: 'rolling', remainingPct: 50, resetAt })
+  assert.ok(view, '面板应渲染估算而不是继续采样中')
+  assert.notEqual(view.text, '采样中')
+  assert.match(view.text, /后耗尽|可支撑到重置/)
+})
+
+test('采样回归：usedPct 真实回落时清空历史（窗口重置的唯一可靠信号）', () => {
+  const { recordSamples, getSamples, resetEtaSamples } = loadClientForUnit().__internal
+  resetEtaSamples()
+  const t0 = Date.now()
+  const resetAt = t0 + 3 * 3_600_000
+  const push = (at, used, nextResetAt = resetAt) => recordSamples({
+    ok: true,
+    fetchedAt: at,
+    windows: [{ id: 'rolling', usedPct: used, remainingPct: 100 - used, resetAt: nextResetAt }],
+  })
+  push(t0, 10)
+  push(t0 + 30_000, 12)
+  push(t0 + 60_000, 15)
+  assert.equal(getSamples('rolling').length, 3)
+  // 新窗口：used 从 15 回落到 1（resetAt 同时也变了）→ 历史必须清空，只保留新窗口样本
+  push(t0 + 90_000, 1, t0 + 5 * 3_600_000)
+  const after = getSamples('rolling')
+  assert.equal(after.length, 1)
+  assert.deepEqual([after[0].at, after[0].used], [t0 + 90_000, 1])
+})
+
+test('采样回归：同一 fetchedAt 重复入样被去重（宿主 30s 缓存）', () => {
+  const { recordSamples, getSamples, resetEtaSamples } = loadClientForUnit().__internal
+  resetEtaSamples()
+  const at = Date.now()
+  const resetAt = at + 3 * 3_600_000
+  const status = (fetchedAt, used) => ({
+    ok: true,
+    fetchedAt,
+    windows: [{ id: 'rolling', usedPct: used, remainingPct: 100 - used, resetAt }],
+  })
+  recordSamples(status(at, 10))
+  recordSamples(status(at, 10))
+  recordSamples(status(at, 12)) // 同一 fetchedAt 但数据不同：仍不得重复入样
+  const samples = getSamples('rolling')
+  assert.equal(samples.length, 1)
+  assert.deepEqual([samples[0].at, samples[0].used], [at, 10])
+  recordSamples(status(at + 30_000, 13))
+  assert.equal(getSamples('rolling').length, 2)
+})
+
+/** 内存版 localStorage，用于验证持久化读写（不触碰真实浏览器存储）。 */
+function createMemoryStorage(initial = {}) {
+  const data = new Map(Object.entries(initial))
+  return {
+    getItem: (key) => (data.has(key) ? data.get(key) : null),
+    setItem: (key, value) => data.set(key, String(value)),
+    removeItem: (key) => data.delete(key),
+    raw: (key) => (data.has(key) ? data.get(key) : null),
+  }
+}
+
+test('采样回归：localStorage 持久化按身份恢复最近 60 分钟 / 最多 120 条 / 去重，重载后接着累积', () => {
+  const now = Date.now()
+  const min = 60_000
+  const key = 'dsh-opencode-status.eta-samples'
+  const baseUrl = 'https://opencode.ai/zen/go'
+  const keyHint = '••••abcd'
+  const resetAt = now + 3 * 3_600_000
+  // 130 个 10 秒间隔样本（全部在最近 60 分钟内）+ 1 条过期样本 + 1 条重复 fetchedAt
+  const recent = []
+  for (let i = 0; i < 130; i += 1) recent.push({ at: now - 30 * min + i * 10_000, used: i })
+  const duplicateAt = recent[115].at
+  const storage = createMemoryStorage({
+    [key]: JSON.stringify({
+      v: 2,
+      baseUrl,
+      keyHint,
+      windows: {
+        rolling: {
+          resetAt,
+          samples: [{ at: now - 61 * min, used: 1 }, ...recent, { at: duplicateAt, used: 999 }],
+        },
+      },
+    }),
+  })
+  const restored = loadClientForUnit({ localStorage: storage }).__internal
+  // 身份（首个 status/config 响应）未知前不恢复，避免盲信旧账号样本
+  assert.equal(restored.getSamples('rolling').length, 0)
+  restored.noteEtaIdentity(baseUrl, keyHint)
+  const restoredSamples = restored.getSamples('rolling')
+  assert.equal(restoredSamples.length, 120, '每窗口只保留最近 120 条')
+  assert.equal(restoredSamples[0].used, 10, '更早的 10 条被裁掉')
+  assert.equal(restoredSamples[restoredSamples.length - 1].used, 129)
+  assert.ok(!restoredSamples.some((s) => s.at === now - 61 * min), '超过 60 分钟的样本不恢复')
+  assert.equal(restoredSamples.filter((s) => s.at === duplicateAt).length, 1, '同一 fetchedAt 只留一条')
+  assert.equal(restoredSamples.find((s) => s.at === duplicateAt).used, 999)
+
+  // 新样本写入后重新加载：历史接着累积，不用从 1 个点重新等 10 分钟
+  const liveStorage = createMemoryStorage()
+  const first = loadClientForUnit({ localStorage: liveStorage }).__internal
+  first.noteEtaIdentity(baseUrl, keyHint)
+  assert.equal(first.getSamples('rolling').length, 0)
+  const feed = (plugin, at, used) => plugin.recordSamples({
+    ok: true,
+    fetchedAt: at,
+    config: { baseUrl, hasKey: true },
+    windows: [{ id: 'rolling', usedPct: used, remainingPct: 100 - used, resetAt }],
+  })
+  feed(first, now - 2 * min, 10)
+  feed(first, now - min, 11)
+  feed(first, now, 12)
+  const persisted = JSON.parse(liveStorage.raw(key))
+  assert.equal(persisted.v, 2)
+  assert.equal(persisted.baseUrl, baseUrl, '持久化必须记录 baseUrl 归属')
+  assert.equal(persisted.keyHint, keyHint, '拿得到 apiKey.hint 时必须一并记录')
+  assert.equal(persisted.windows.rolling.samples.length, 3)
+  assert.doesNotMatch(JSON.stringify(persisted), /api.?key|token|secret|authorization/i, '持久化不得包含密钥类信息')
+  const reloaded = loadClientForUnit({ localStorage: liveStorage }).__internal
+  assert.equal(reloaded.getSamples('rolling').length, 0, '身份未知前不恢复')
+  reloaded.noteEtaIdentity(baseUrl, keyHint)
+  assert.deepEqual(
+    Array.from(reloaded.getSamples('rolling'), (s) => [s.at, s.used]),
+    Array.from(first.getSamples('rolling'), (s) => [s.at, s.used]),
+  )
+  feed(reloaded, now + 30_000, 13)
+  assert.equal(reloaded.getSamples('rolling').length, 4)
+
+  // localStorage 读/写抛错（隐私模式、配额满）时静默降级：照常采样，不影响面板
+  const brokenStorage = {
+    getItem: () => { throw new Error('storage denied') },
+    setItem: () => { throw new Error('storage denied') },
+    removeItem: () => { throw new Error('storage denied') },
+  }
+  const degraded = loadClientForUnit({ localStorage: brokenStorage }).__internal
+  assert.doesNotThrow(() => feed(degraded, now, 5))
+  assert.equal(degraded.getSamples('rolling').length, 1)
+})
+
+test('采样回归：持久化按 baseUrl / 账号 hint 隔离，身份不匹配整体丢弃且不混出估算（F2）', () => {
+  const now = Date.now()
+  const min = 60_000
+  const key = 'dsh-opencode-status.eta-samples'
+  const resetAt = now + 3_600_000
+  const baseUrlA = 'https://opencode.ai/zen/go'
+  const baseUrlB = 'https://gateway.example.test/go'
+  const hintA = '••••1111'
+  const hintB = '••••2222'
+  const payload = (patch = {}) => JSON.stringify({
+    v: 2,
+    baseUrl: baseUrlA,
+    keyHint: hintA,
+    windows: { rolling: { resetAt, samples: [{ at: now - 3 * min, used: 10 }, { at: now - 2 * min, used: 20 }] } },
+    ...patch,
+  })
+  const loadWith = (raw) => {
+    const storage = createMemoryStorage({ [key]: raw })
+    return { storage, internal: loadClientForUnit({ localStorage: storage }).__internal }
+  }
+
+  // 1) 换 baseUrl：整体丢弃，并清掉不属于当前账号的持久化副本
+  const wrongBase = loadWith(payload({ baseUrl: baseUrlB }))
+  wrongBase.internal.noteEtaIdentity(baseUrlA, hintA)
+  assert.equal(wrongBase.internal.getSamples('rolling').length, 0, 'baseUrl 不匹配必须整体丢弃')
+  assert.equal(wrongBase.storage.raw(key), null)
+
+  // 2) 同 baseUrl、hint 不同（换了账号）：整体丢弃
+  const wrongHint = loadWith(payload({ keyHint: hintB }))
+  wrongHint.internal.noteEtaIdentity(baseUrlA, hintA)
+  assert.equal(wrongHint.internal.getSamples('rolling').length, 0, '账号 hint 不匹配必须整体丢弃')
+
+  // 3) 旧版 v1 没有身份归属：无法校验，整体丢弃
+  const legacy = loadWith(JSON.stringify({ v: 1, windows: { rolling: { resetAt, samples: [{ at: now - 2 * min, used: 20 }] } } }))
+  legacy.internal.noteEtaIdentity(baseUrlA, hintA)
+  assert.equal(legacy.internal.getSamples('rolling').length, 0, '旧版无身份样本必须丢弃')
+
+  // 4) 身份匹配：正常恢复
+  const matched = loadWith(payload())
+  matched.internal.noteEtaIdentity(baseUrlA, hintA)
+  assert.equal(matched.internal.getSamples('rolling').length, 2, '身份匹配时恢复历史')
+
+  // 5) 拿不到 hint 时只按 baseUrl 隔离（已知限制：同 baseUrl 换账号无法识别）
+  const noHint = loadWith(payload())
+  noHint.internal.noteEtaIdentity(baseUrlA, null)
+  assert.equal(noHint.internal.getSamples('rolling').length, 2, '拿不到 hint 时按 baseUrl 隔离')
+
+  // 5b) 恢复时 hint 未知、之后拿到的 hint 与存储不同（hint 晚到）：已恢复样本必须丢弃
+  const lateHint = loadWith(payload())
+  lateHint.internal.noteEtaIdentity(baseUrlA, null)
+  assert.equal(lateHint.internal.getSamples('rolling').length, 2)
+  lateHint.internal.noteEtaIdentity(baseUrlA, hintB)
+  assert.equal(lateHint.internal.getSamples('rolling').length, 0, 'hint 晚到且不匹配时必须丢弃已恢复样本')
+
+  // 6) 运行时换 baseUrl：旧历史立即作废，不会把两个账号的 usedPct 拼成错误估算
+  const runtime = loadClientForUnit().__internal
+  const feed = (at, used, url) => runtime.recordSamples({
+    ok: true,
+    fetchedAt: at,
+    config: { baseUrl: url, hasKey: true },
+    windows: [{ id: 'rolling', usedPct: used, remainingPct: 100 - used, resetAt }],
+  })
+  feed(now - 2 * min, 10, baseUrlA)
+  feed(now - min, 20, baseUrlA)
+  assert.equal(runtime.getSamples('rolling').length, 2)
+  feed(now, 50, baseUrlB)
+  const afterSwitch = runtime.getSamples('rolling')
+  assert.equal(afterSwitch.length, 1, '换 baseUrl 后旧账号历史必须清空')
+  assert.deepEqual([afterSwitch[0].at, afterSwitch[0].used], [now, 50])
+  assert.equal(runtime.estimateEta(afterSwitch, 50, resetAt), null, '只有一个新样本时不得算出混用估算')
+
+  // 7) 运行时换账号（同 baseUrl、hint 变）：同样清空历史
+  runtime.noteEtaIdentity(baseUrlA, hintA)
+  feed(now + 30_000, 51, baseUrlA)
+  feed(now + 60_000, 52, baseUrlA)
+  runtime.noteEtaIdentity(baseUrlA, hintB)
+  assert.equal(runtime.getSamples('rolling').length, 0, '账号 hint 变化后旧历史必须清空')
+})
+
+test('采样回归：同账号 hint 晚到只补写身份、不清空已恢复历史（F2-LATE-HINT）', () => {
+  const now = Date.now()
+  const key = 'dsh-opencode-status.eta-samples'
+  const baseUrlA = 'https://opencode.ai/zen/go'
+  const hintA = '••••1111'
+  const resetAt = now + 3_600_000
+  const storage = createMemoryStorage({
+    [key]: JSON.stringify({
+      v: 2,
+      baseUrl: baseUrlA,
+      keyHint: hintA,
+      windows: { rolling: { resetAt, samples: [{ at: now - 3 * 60_000, used: 10 }, { at: now - 2 * 60_000, used: 20 }] } },
+    }),
+  })
+  const plugin = loadClientForUnit({ localStorage: storage }).__internal
+  // status 先到：只有 baseUrl，hint 未知 → 按 baseUrl 恢复（缺证据不下结论）
+  plugin.noteEtaIdentity(baseUrlA, null)
+  assert.equal(plugin.getSamples('rolling').length, 2, 'hint 未知时按 baseUrl 恢复历史')
+  // config 后到，返回同一账号的同一 hint：只补写身份，不得清空
+  plugin.noteEtaIdentity(baseUrlA, hintA)
+  assert.equal(plugin.getSamples('rolling').length, 2, '同 hint 晚到不得清空历史')
+  assert.notEqual(storage.raw(key), null, '同 hint 晚到也不得清掉持久化副本')
+  assert.equal(JSON.parse(storage.raw(key)).windows.rolling.samples.length, 2)
+  // 后续样本继续累积，而不是从头再等 10 分钟
+  plugin.recordSamples({
+    ok: true,
+    fetchedAt: now,
+    config: { baseUrl: baseUrlA, hasKey: true },
+    windows: [{ id: 'rolling', usedPct: 30, remainingPct: 70, resetAt }],
+  })
+  assert.equal(plugin.getSamples('rolling').length, 3, '同 hint 晚到后样本应继续累积')
+})
+
+test('采样回归：真实 apply→status→refreshConfig 顺序下同账号 hint 晚到不清空历史（F2-LATE-HINT）', async () => {
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  const now = Date.now()
+  const min = 60_000
+  const baseUrl = 'https://opencode.ai/zen/go'
+  const hint = '••••1111'
+  const key = 'dsh-opencode-status.eta-samples'
+  const resetAt = now + 2 * 3_600_000
+  // 存储里 3 条同账号历史（首尾跨度 10 分钟）→ 恢复后应能直接出估算
+  const storage = createMemoryStorage({
+    [key]: JSON.stringify({
+      v: 2,
+      baseUrl,
+      keyHint: hint,
+      windows: {
+        rolling: {
+          resetAt,
+          samples: [
+            { at: now - 12 * min, used: 10 },
+            { at: now - 6 * min, used: 15 },
+            { at: now - 2 * min, used: 20 },
+          ],
+        },
+      },
+    }),
+  })
+  const status = {
+    ok: true,
+    mode: 'ready',
+    fetchedAt: now - min,
+    config: { baseUrl, hasKey: true },
+    windows: [{ id: 'rolling', label: '滚动窗口 (5h)', shortLabel: '5h', usedPct: 30, remainingPct: 70, status: 'ok', resetAt }],
+  }
+  const config = { baseUrl, apiKey: { configured: true, source: 'profile', writable: true, hint } }
+  const app = loadPollingRuntime({
+    localStorage: storage,
+    fetch: (url) => (url.includes('/api/opencode-status/config')
+      ? { ok: true, json: async () => config }
+      : { ok: true, json: async () => status }),
+  })
+  // apply → 首次 status 只带 baseUrl：恢复 3 条并追加当前样本
+  await flush()
+  assert.equal(app.plugin.__internal.getSamples('rolling').length, 4, 'status 先到时应恢复并继续累积')
+  assert.match(app.plugin.__internal.etaView(status.windows[0])?.text ?? '', /后耗尽|可支撑到重置/, '恢复的历史应能直接出估算')
+
+  // 点开面板：refreshStatus（同一 fetchedAt 去重）+ refreshConfig（同一 hint 晚到）
+  const findFirstButton = (node) => {
+    if (node == null || node === false || typeof node !== 'object') return null
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = findFirstButton(child)
+        if (hit) return hit
+      }
+      return null
+    }
+    if (node.type === 'button') return node
+    for (const child of node.children ?? []) {
+      const hit = findFirstButton(child)
+      if (hit) return hit
+    }
+    return null
+  }
+  const tree = app.render(app.registered[0]({ wide: true }))
+  const button = findFirstButton(tree)
+  assert.ok(button && typeof button.props.onClick === 'function', 'footer 必须渲染出可点击按钮')
+  button.props.onClick()
+  await flush()
+
+  assert.equal(app.plugin.__internal.getSamples('rolling').length, 4, '同账号同 hint 晚到不得清空历史')
+  assert.match(app.plugin.__internal.etaView(status.windows[0])?.text ?? '', /后耗尽|可支撑到重置/, '点开面板后估算仍在，不退回采样中')
+  assert.equal(JSON.parse(storage.raw(key)).windows.rolling.samples.length, 4, '存储副本也应保留 4 条')
+  app.disposePlugin()
 })
 
 test('三态渲染：面板可估算才渲染（悬浮卡紧凑视图不展示估算），不可估算不渲染任何节点', () => {
