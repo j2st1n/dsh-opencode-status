@@ -817,6 +817,12 @@ test('P1 信息设计：相对时间/过期提示、单一主百分比、免责�
   const miniRow = text.slice(text.indexOf('function MiniQuotaRow'), text.indexOf('// ---------- 用量视图'))
   assert.doesNotMatch(miniRow, /`↻/)
   assert.match(miniRow, /⏱ \$\{timeUntil\(w\.resetAt\)\}/)
+  // 紧凑行右侧两列必须固定宽度，否则倒计时长短会把各自的进度条挤成不同宽度，
+  // 三条进度条无法横向比较（99% 的条比 87% 还短就是这个原因）。
+  assert.match(miniRow, /key: 'v', style: \{ width: 32/)
+  assert.match(miniRow, /key: 'r', style: \{ width: 50/)
+  assert.doesNotMatch(miniRow, /key: 'v'[^}]*minWidth/)
+  assert.doesNotMatch(miniRow, /key: 'r'[^}]*minWidth/)
 
   // 呼吸动画只播一次，不再无限循环
   assert.match(text, /\.oc-dot-live \{ animation: ocPulse 1\.2s ease-out 1 both \}/)
@@ -1135,11 +1141,12 @@ test('client 工厂可在最小 React stub 下加载，注册两个槽位且 rai
   assert.equal(typeof rail.props.onClick, 'function')
 })
 
-test('220ms 悬浮卡展示标题 + Go 标识 + 上次同步与三窗口紧凑行，且不拦截点击', () => {
+test('220ms 悬浮卡展示标题 + 上次同步与三窗口紧凑行，且不拦截点击', () => {
   const text = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
   const card = text.slice(text.indexOf('function HoverCard'), text.indexOf('/** 悬浮卡紧凑行'))
   assert.match(card, /OpenCode GO 用量/)
-  assert.match(card, /'GO'/)
+  // 标题已含「OpenCode GO」，不再叠一个 GO 徽章
+  assert.doesNotMatch(card, /'GO'/)
   assert.match(card, /上次同步 \$\{fmtClock\(st\.fetchedAt\)\}/)
   assert.match(card, /MiniQuotaRow/)
   assert.match(card, /点击查看详情/)

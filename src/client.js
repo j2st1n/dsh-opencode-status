@@ -526,25 +526,6 @@ window.__ModuleLoader__.load({
         [
           h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 } }, [
             h('span', { key: 't', style: { fontWeight: 600, fontSize: 12, color: T.label } }, 'OpenCode GO 用量'),
-            // Go 标识（纯展示徽章，不是按钮）
-            h(
-              'span',
-              {
-                key: 'go',
-                style: {
-                  fontSize: 9,
-                  fontWeight: 700,
-                  letterSpacing: 0.4,
-                  color: '#fff',
-                  background: T.brand,
-                  borderRadius: 4,
-                  padding: '1px 5px',
-                  lineHeight: '13px',
-                  flexShrink: 0,
-                },
-              },
-              'GO',
-            ),
             h(
               'span',
               {
@@ -575,18 +556,21 @@ window.__ModuleLoader__.load({
       const w = props.window
       const remaining = w?.remainingPct ?? null
       const color = remainingColor(remaining)
+      // 右侧两列必须是**固定宽度**：若按内容自适应，「⏱ 18d15h」比「⏱ 3h26m」宽，
+      // 会把该行的进度条挤短，三条进度条的满格基准就各不相同，百分比再准也无法横向比较。
+      // 标签列同样固定，短标签最长 2 个字符（5h / 周 / 月）。
       return h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
-        h('span', { key: 'n', style: { width: 46, flexShrink: 0, fontSize: 10, color: T.secondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.shortLabel ?? w?.label ?? '—'),
+        h('span', { key: 'n', style: { width: 28, flexShrink: 0, fontSize: 10, color: T.secondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.shortLabel ?? w?.label ?? '—'),
         h(
           'div',
-          { key: 'bar', style: { flex: 1, minWidth: 0, height: 3, borderRadius: 2, background: `color-mix(in srgb, ${color} 16%, transparent)`, overflow: 'hidden' } },
+          { key: 'bar', style: { flex: 1, minWidth: 0, height: 3, borderRadius: 2, background: `color-mix(in srgb, ${color} 28%, transparent)`, overflow: 'hidden' } },
           remaining === null
             ? null
             : h('div', { style: { height: '100%', width: `${clampPct(remaining)}%`, background: color, borderRadius: 2 } }),
         ),
-        h('span', { key: 'v', style: { minWidth: 30, flexShrink: 0, textAlign: 'right', fontSize: 10, fontWeight: 600, color, fontVariantNumeric: 'tabular-nums' } }, remaining === null ? '—' : pctText(remaining)),
+        h('span', { key: 'v', style: { width: 32, flexShrink: 0, textAlign: 'right', fontSize: 10, fontWeight: 600, color, fontVariantNumeric: 'tabular-nums' } }, remaining === null ? '—' : pctText(remaining)),
         // 倒计时用 ⏱ 区分刷新动作的 ↻，避免两个图标同义混淆。
-        h('span', { key: 'r', style: { minWidth: 34, flexShrink: 0, textAlign: 'right', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } }, w?.resetAt ? `⏱ ${timeUntil(w.resetAt)}` : ''),
+        h('span', { key: 'r', style: { width: 50, flexShrink: 0, textAlign: 'right', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } }, w?.resetAt ? `⏱ ${timeUntil(w.resetAt)}` : ''),
       ])
     }
 
