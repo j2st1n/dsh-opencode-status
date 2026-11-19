@@ -159,313 +159,6 @@ window.__ModuleLoader__.load({
       return `${Math.round(clampPct(value))}%`
     }
 
-    /** 最紧张的用量窗口：头部只给判断性摘要，避免与窗口行重复表达同一个数字。 */
-    function tightestWindow(status) {
-      const windows = Array.isArray(status?.windows) ? status.windows : []
-      let tightest = null
-      for (const w of windows) {
-        if (typeof w?.remainingPct !== 'number') continue
-        if (!tightest || w.remainingPct < tightest.remainingPct) tightest = w
-      }
-      return tightest
-    }
-
-    // ---------- 消耗速率估算（按当前速率还能撑多久） ----------
-    // 采样放模块级而不是 store：每次采样不触发整树重渲染，渲染时按需读取。
-    const ETA_SAMPLE_WINDOW_MS = 60 * 60_000
-    const ETA_MAX_SAMPLES = 120
-    const ETA_MIN_SAMPLES = 3
-    const ETA_MIN_SPAN_MS = 10 * 60_000
-    // 持久化键与版本：v2 起带账号归属（baseUrl + 可选 keyHint）。
-    const ETA_SAMPLES_STORAGE_KEY = 'dsh-opencode-status.eta-samples'
-    const ETA_SAMPLES_STORAGE_VERSION = 2
-
-    /** windowId -> { resetAt, samples: [{ at, used }] }；at 取 status.fetchedAt（不是 Date.now）。 */
-    const etaSamples = new Map()
-
-    /**
-     * 采样归属身份：baseUrl 必有（status.config.baseUrl / config.baseUrl），apiKeyHint 取自
-     * GET /api/opencode-status/config 的 apiKey.hint（只含末四位的掩码，不是密钥本身），可能拿不到。
-     * 持久化按身份隔离，判据遵循「缺证据不下结论」：baseUrl 不同才确凿丢弃；hint 只有双方都存在
-     * 且不同才确凿丢弃；任一方 hint 缺失（例如 status 先到、config 后到）退回只按 baseUrl 隔离，保留历史。
-     * 已知限制：同一 baseUrl 下换账号、且拿不到 hint（hint 为空）时无法识别，旧样本会被复用；
-     * 此时只按 baseUrl 隔离——宁可暂时不分账号，也不能误删同账号数据。
-     */
-    const etaIdentity = { baseUrl: null, keyHint: null }
-    let etaRestorePayload = null
-    let etaRestoreSettled = false
-    // 恢复时持久化里记录的 hint：首轮拿不到 hint（只按 baseUrl 恢复）时，用它在 hint 晚到后补一次账号校验。
-    let etaRestoredKeyHint = null
-
-    /** 读取持久化原文但先不恢复：身份要等首个 status/config 响应才知道，不能盲信旧账号样本。 */
-    function readEtaSamplesPayload() {
-      try {
-        if (typeof localStorage === 'undefined' || !localStorage) {
-          etaRestoreSettled = true
-          return
-        }
-        const raw = localStorage.getItem(ETA_SAMPLES_STORAGE_KEY)
-        if (!raw) {
-          etaRestoreSettled = true
-          return
-        }
-        const parsed = JSON.parse(raw)
-        // 旧版 v1 没有账号归属，无法校验是否同一账号：整体丢弃，不做部分恢复。
-        if (!parsed || parsed.v !== ETA_SAMPLES_STORAGE_VERSION || typeof parsed.baseUrl !== 'string' || !parsed.baseUrl) {
-          etaRestoreSettled = true
-          return
-        }
-        etaRestorePayload = parsed
-      } catch {
-        etaRestoreSettled = true
-      }
-    }
-
-    /** 判断持久化样本是否属于当前账号：baseUrl 必须一致；双方都有 hint 且不同才判为不同账号。 */
-    function etaIdentityMatches(payload) {
-      if (!etaIdentity.baseUrl || payload?.baseUrl !== etaIdentity.baseUrl) return false
-      const storedHint = typeof payload.keyHint === 'string' && payload.keyHint ? payload.keyHint : null
-      if (storedHint && etaIdentity.keyHint && storedHint !== etaIdentity.keyHint) return false
-      return true
-    }
-
-    /**
-     * 首次拿到 baseUrl 后恢复持久化样本：只保留最近 60 分钟、每窗口最多 120 个样本、按 fetchedAt 去重。
-     * 身份不匹配（或旧版无身份）时整体丢弃，绝不部分恢复；存储不可用/损坏时静默降级为空历史。
-     */
-    function restoreEtaSamples() {
-      if (etaRestoreSettled || !etaIdentity.baseUrl) return
-      etaRestoreSettled = true
-      const payload = etaRestorePayload
-      etaRestorePayload = null
-      etaRestoredKeyHint = null
-      if (!payload || !etaIdentityMatches(payload)) {
-        // 不是当前账号的历史：清掉，避免换账号/换 baseUrl 后混用出看似正常的错误估算。
-        if (payload) {
-          try {
-            if (typeof localStorage !== 'undefined' && localStorage) localStorage.removeItem(ETA_SAMPLES_STORAGE_KEY)
-          } catch {}
-        }
-        return
-      }
-      etaRestoredKeyHint = typeof payload.keyHint === 'string' && payload.keyHint ? payload.keyHint : null
-      try {
-        const storedWindows = payload.windows
-        if (!storedWindows || typeof storedWindows !== 'object' || Array.isArray(storedWindows)) return
-        const cutoff = Date.now() - ETA_SAMPLE_WINDOW_MS
-        for (const [id, stored] of Object.entries(storedWindows)) {
-          if (typeof id !== 'string' || !id) continue
-          const rows = Array.isArray(stored?.samples) ? stored.samples : []
-          // 同一 fetchedAt 只留一条（与运行时去重口径一致，后写入值覆盖）。
-          const byAt = new Map()
-          for (const row of rows) {
-            if (typeof row?.at !== 'number' || !Number.isFinite(row.at)) continue
-            if (typeof row?.used !== 'number' || !Number.isFinite(row.used)) continue
-            byAt.set(row.at, { at: row.at, used: row.used })
-          }
-          const samples = [...byAt.values()].filter((s) => s.at >= cutoff).sort((a, b) => a.at - b.at)
-          if (!samples.length) continue
-          const resetAt = typeof stored?.resetAt === 'number' && Number.isFinite(stored.resetAt) ? stored.resetAt : null
-          etaSamples.set(id, { resetAt, samples: samples.slice(-ETA_MAX_SAMPLES) })
-        }
-      } catch {}
-    }
-
-    /**
-     * 记录当前账号身份（baseUrl 必有、keyHint 可选）：身份变化说明换了 baseUrl/账号，
-     * 旧历史必须整体作废，否则两个账号的 usedPct 会拼出错误速率（例如旧账号 10→20 + 新账号 50）。
-     */
-    function noteEtaIdentity(baseUrl, keyHint) {
-      let changed = false
-      if (typeof baseUrl === 'string' && baseUrl && baseUrl !== etaIdentity.baseUrl) {
-        if (etaIdentity.baseUrl) changed = true
-        etaIdentity.baseUrl = baseUrl
-      }
-      if (typeof keyHint === 'string' && keyHint && keyHint !== etaIdentity.keyHint) {
-        // status 与 config 是两个请求，config.hint 天然可能晚到（此时 etaIdentity.keyHint 为 null）。
-        // 只有「已知 hint 与本次 hint 都确凿存在且不同」才能判定换了账号；缺证据一律不下结论，
-        // 否则同一账号在 status 先到、config 后到时会被误判并清空刚恢复的持久化历史。
-        const knownHint = etaIdentity.keyHint ?? etaRestoredKeyHint
-        if (knownHint && keyHint !== knownHint) changed = true
-        // 同 hint 晚到只补写身份，不清空历史。
-        etaIdentity.keyHint = keyHint
-      }
-      if (changed) {
-        etaSamples.clear()
-        etaRestoredKeyHint = null
-        persistEtaSamples()
-      }
-      restoreEtaSamples()
-    }
-
-    /** 把采样写回 localStorage：带 baseUrl/keyHint 归属；只含窗口 id、fetchedAt 与用量百分比，不写密钥或凭证。 */
-    function persistEtaSamples() {
-      try {
-        if (typeof localStorage === 'undefined' || !localStorage) return
-        if (!etaIdentity.baseUrl) return // 身份未知不落盘，避免无法校验归属的历史
-        const windows = {}
-        for (const [id, entry] of etaSamples) {
-          if (!entry.samples.length) continue
-          windows[id] = {
-            resetAt: entry.resetAt,
-            samples: entry.samples.map(({ at, used }) => ({ at, used })),
-          }
-        }
-        localStorage.setItem(ETA_SAMPLES_STORAGE_KEY, JSON.stringify({
-          v: ETA_SAMPLES_STORAGE_VERSION,
-          baseUrl: etaIdentity.baseUrl,
-          keyHint: etaIdentity.keyHint,
-          windows,
-        }))
-      } catch {}
-    }
-
-    /**
-     * 记录一次成功刷新的样本：按窗口分组，用 fetchedAt 去重（宿主 30s 缓存会让多次轮询拿到同一个时间）。
-     * 清空判据的前提：同一窗口内上游 usedPct 单调不减（percent 由窗口内累计用量换算，只增不减）；
-     * 只有 usedPct 真实回落（used < last.used）才说明窗口已重置、需要清空历史。
-     * 已知漏检：窗口重置恰好发生在两次轮询之间、且新窗口用量已超过旧值（例如 5 → 0 → 6）时不会清空，
-     * 历史会跨重置累积；0 → 0 的次 1% 重置也无法检测。这是有意的取舍：不能改用 resetAt 兜底——
-     * 滚动 5h 是滑动窗口，resetAt 会随早先用量过期不断前移，把它当重置信号正是「永远采样中」的根因。
-     */
-    function recordSamples(status) {
-      // 先用响应里的 baseUrl 确认账号归属：换账号后旧样本必须整体作废，不能混用两个账号的 usedPct。
-      noteEtaIdentity(status?.config?.baseUrl, null)
-      if (!status?.ok || typeof status.fetchedAt !== 'number') return
-      const windows = Array.isArray(status.windows) ? status.windows : []
-      let changed = false
-      for (const w of windows) {
-        const id = w?.id
-        if (!id || typeof w?.usedPct !== 'number') continue
-        const at = status.fetchedAt
-        const used = w.usedPct
-        const resetAt = typeof w.resetAt === 'number' && Number.isFinite(w.resetAt) ? w.resetAt : null
-        let entry = etaSamples.get(id)
-        if (!entry) {
-          entry = { resetAt, samples: [] }
-          etaSamples.set(id, entry)
-        }
-        const last = entry.samples[entry.samples.length - 1]
-        if (last && last.at === at) continue // 同一份缓存数据不重复采样
-        // resetAt 变化只更新基准（下面统一赋值），不清历史；只有用量真实回落才是窗口重置。
-        if (last && used < last.used) entry.samples = []
-        entry.resetAt = resetAt
-        entry.samples.push({ at, used })
-        changed = true
-        // 只保留最近 60 分钟、每窗口最多 120 个样本。
-        const cutoff = at - ETA_SAMPLE_WINDOW_MS
-        while (entry.samples.length && entry.samples[0].at < cutoff) entry.samples.shift()
-        if (entry.samples.length > ETA_MAX_SAMPLES) entry.samples.splice(0, entry.samples.length - ETA_MAX_SAMPLES)
-      }
-      if (changed) persistEtaSamples()
-    }
-
-    // 模块加载时先读持久化原文；身份要等首个 status/config 响应，确认同账号后才恢复历史。
-    readEtaSamplesPayload()
-
-    /**
-     * 估算「按当前速率还能撑多久」。样本 ≥3、首尾跨度 ≥10 分钟、速率 >0 三者缺一即返回 null；
-     * 速率只用首尾两点（不做回归，抗噪且好解释）。resetAt 缺失或已过期时无法判断能否撑到重置，同样返回 null。
-     * 返回 { etaMs, untilResetMs, exhaustsBeforeReset, spanMs }：能否撑到重置由调用方决定怎么展示。
-     */
-    function estimateEta(samples, remainingPct, resetAt, now = Date.now()) {
-      if (!Array.isArray(samples) || samples.length < ETA_MIN_SAMPLES) return null
-      if (typeof remainingPct !== 'number' || !Number.isFinite(remainingPct) || remainingPct <= 0) return null
-      if (typeof resetAt !== 'number' || !Number.isFinite(resetAt)) return null
-      const first = samples[0]
-      const last = samples[samples.length - 1]
-      if (typeof first?.at !== 'number' || typeof last?.at !== 'number') return null
-      if (typeof first?.used !== 'number' || typeof last?.used !== 'number') return null
-      const spanMs = last.at - first.at
-      if (!(spanMs >= ETA_MIN_SPAN_MS)) return null
-      const ratePerMs = (last.used - first.used) / spanMs
-      if (!(ratePerMs > 0)) return null
-      const etaMs = remainingPct / ratePerMs
-      if (!Number.isFinite(etaMs) || etaMs <= 0) return null
-      const untilResetMs = resetAt - now
-      if (!Number.isFinite(untilResetMs) || untilResetMs <= 0) return null
-      return { etaMs, untilResetMs, exhaustsBeforeReset: etaMs < untilResetMs, spanMs }
-    }
-
-    /** 时长短文案：<1h 用分钟，<24h 用 h+m，更长用 d+h（「还能撑多久」不需要精确到分秒）。 */
-    function fmtEtaDuration(ms) {
-      const mins = Math.max(1, Math.round(ms / 60_000))
-      if (mins < 60) return `${mins}m`
-      const hours = Math.floor(mins / 60)
-      if (hours < 24) return `${hours}h${mins % 60 ? `${mins % 60}m` : ''}`
-      const days = Math.floor(hours / 24)
-      return `${days}d${hours % 24 ? `${hours % 24}h` : ''}`
-    }
-
-    /**
-     * 估算值粗化：上游只给整数 percent，量化误差会让 ETA 的真实区间比点值宽 2-3 倍，
-     * 分钟级精度属于虚假精确。按「两位有效数字」粗化，既保留量级又不再暗示精度：
-     *   <1h 取 5 分钟、1-10h 取 30 分钟、≥10h 取 1 小时、≥48h 取 1 天。
-     */
-    function coarsenEta(ms) {
-      const minutes = ms / 60_000
-      if (minutes < 60) return Math.max(5, Math.round(minutes / 5) * 5) * 60_000
-      if (minutes < 600) return Math.round(minutes / 30) * 30 * 60_000
-      const hours = minutes / 60
-      if (hours < 48) return Math.round(hours) * 3_600_000
-      return Math.round(hours / 24) * 86_400_000
-    }
-
-    /**
-     * 估算文案的三态：不可估算返回 null（调用方完全不渲染节点，不显示 "--"/"估算中" 之类占位）；
-     * 撑不到重置用告警色「约 X 后耗尽」，撑得到用中性色「可支撑到重置」。
-     * 文案只用「按当前速率」的描述，不用「预计/将」这种预测口吻。
-     * 行内必须保留「约」与「后」：这是常驻可见的唯一表述（悬浮卡等场景 title 不可达），
-     * 缺了「约」会被读成确定性断言，与「仅供参考」的定位冲突。
-     * compact（悬浮微卡，外宽约 220px）整段不展示：一行放不下「名称/条/剩余/估算/倒计时」五项，
-     * 缩字号、砍进度条/倒计时、截断估算都不可接受，所以宁可不显示；估算逻辑仍共用 estimateEta，只是呈现密度不同。
-     * 这是有意为之，不是漏渲染。
-     */
-    function etaView(w, options = {}) {
-      if (options?.compact) return null
-      const entry = etaSamples.get(w?.id)
-      if (!entry || !entry.samples.length) return null
-      const estimate = estimateEta(entry.samples, w?.remainingPct, w?.resetAt)
-      if (!estimate) {
-        // 「采样中」只在样本数或跨度还不够时出现：让用户能区分「功能没加载」与「还在攒数据」。
-        // 速率 0、剩余 0、重置缺失或已过期都不是采样问题，仍然什么都不显示。
-        const samples = entry.samples
-        const span = samples[samples.length - 1].at - samples[0].at
-        if (samples.length >= ETA_MIN_SAMPLES && span >= ETA_MIN_SPAN_MS) return null
-        if (typeof w?.remainingPct !== 'number' || w.remainingPct <= 0) return null
-        if (!w?.resetAt || w.resetAt <= Date.now()) return null
-        return {
-          text: '采样中',
-          color: T.secondary,
-          title: `正在积累采样：已有 ${samples.length} 个点、跨度约 ${Math.max(1, Math.round(span / 60_000))} 分钟；需要 ${ETA_MIN_SAMPLES} 个点且跨度满 ${ETA_MIN_SPAN_MS / 60_000} 分钟`,
-        }
-      }
-      const minutes = Math.max(1, Math.round(estimate.spanMs / 60_000))
-      // 文案只说「按最近 N 分钟的消耗速率（按当前速率）」的实测依据，不写「预计/将」这类预测口吻。
-      const title = `按最近 ${minutes} 分钟的消耗速率估算（按当前速率），仅供参考`
-      // 保留完整字面「约 X 后耗尽」：真实 Chrome 实测在 326px/262px 内容宽下都不会截断，只会让标签多收缩。
-      return estimate.exhaustsBeforeReset
-        ? { text: `约 ${fmtEtaDuration(coarsenEta(estimate.etaMs))} 后耗尽`, color: T.warn, title }
-        : { text: '可支撑到重置', color: T.secondary, title }
-    }
-
-    /** 仅供测试与诊断：读取某个窗口的采样副本。 */
-    function getSamples(windowId) {
-      const entry = etaSamples.get(windowId)
-      return entry ? entry.samples.map((s) => ({ ...s })) : []
-    }
-
-    /** 仅供测试与诊断：清空所有采样（含持久化副本），并阻止本次生命周期内再从存储恢复。 */
-    function resetEtaSamples() {
-      etaSamples.clear()
-      etaRestorePayload = null
-      etaRestoreSettled = true
-      etaRestoredKeyHint = null
-      try {
-        if (typeof localStorage !== 'undefined' && localStorage) localStorage.removeItem(ETA_SAMPLES_STORAGE_KEY)
-      } catch {}
-    }
-
     /** 月窗口剩余百分比；上游只给百分比，不存在金额余额。 */
     function monthlyRemainingOf(status) {
       if (!status) return null
@@ -533,7 +226,6 @@ window.__ModuleLoader__.load({
           const status = await api('/api/opencode-status')
           // 只接受最新 epoch 的响应：手动刷新之后返回的在途 GET 一律丢弃。
           if (epoch === statusEpoch) {
-            recordSamples(status)
             store.set({ status, error: null })
           }
         } catch (err) {
@@ -548,8 +240,6 @@ window.__ModuleLoader__.load({
     async function refreshConfig() {
       try {
         const config = await api('/api/opencode-status/config')
-        // config.apiKey.hint 是「••••末四位」掩码（不是密钥），用来判断持久化样本是否同一账号。
-        noteEtaIdentity(config?.baseUrl, config?.apiKey?.hint)
         store.set({ config })
       } catch {}
     }
@@ -562,7 +252,7 @@ window.__ModuleLoader__.load({
     /**
      * 页面恢复可见时立即补拉一次；隐藏期间保留 ticker（浏览器会自行节流后台定时器）。
      * 旧实现 hidden 时 clearInterval，恢复只靠这一次 visibilitychange——事件一旦丢失，
-     * 采样就永久停摆，面板只能停在 1-2 个样本的「采样中」。
+     * 轮询就永久停摆，面板会一直显示冻结的旧额度。
      */
     function onVisibilityChange() {
       if (typeof document !== 'undefined' && document.hidden) return
@@ -589,9 +279,8 @@ window.__ModuleLoader__.load({
 
     /**
      * 安装 30 秒 GET 轮询（幂等），返回同一个幂等 disposer。旧实现在 FooterEntry 的挂载 effect 里建 ticker：
-     * footer 卸载（侧栏收起、布局切换）或 hidden 清理后事件丢失，采样永久停止，
-     * 面板只剩 1-2 个内存样本，于是永远「采样中」。轮询属于模块级资源，组件卸载不拆除，
-     * 但插件 dispose 时必须释放（见 disposeStatusPolling）。
+     * footer 卸载（侧栏收起、布局切换）或 hidden 清理后事件丢失，轮询永久停止，面板显示冻结的旧额度。
+     * 轮询属于模块级资源，组件卸载不拆除，但插件 dispose 时必须释放（见 disposeStatusPolling）。
      */
     function ensureStatusPolling() {
       if (!statusPollingStarted) {
@@ -624,7 +313,6 @@ window.__ModuleLoader__.load({
           headers: { 'content-type': 'application/json' },
         })
         // 手动刷新自身的响应始终落库（刷新期间已阻止新的 GET）。
-        recordSamples(status)
         store.set({ status, error: null })
       } catch (err) {
         store.set({ error: String(err?.message ?? err) })
@@ -887,9 +575,6 @@ window.__ModuleLoader__.load({
       const w = props.window
       const remaining = w?.remainingPct ?? null
       const color = remainingColor(remaining)
-      // compact：悬浮微卡外宽约 220px，五个元素塞不进去。这里整段不渲染估算（etaView 返回 null），
-      // 不缩字号、不砍进度条/倒计时、不截断成残句；面板 QuotaRow 仍照常展示。
-      const eta = etaView(w, { compact: true })
       return h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
         h('span', { key: 'n', style: { width: 46, flexShrink: 0, fontSize: 10, color: T.secondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.shortLabel ?? w?.label ?? '—'),
         h(
@@ -900,10 +585,6 @@ window.__ModuleLoader__.load({
             : h('div', { style: { height: '100%', width: `${clampPct(remaining)}%`, background: color, borderRadius: 2 } }),
         ),
         h('span', { key: 'v', style: { minWidth: 30, flexShrink: 0, textAlign: 'right', fontSize: 10, fontWeight: 600, color, fontVariantNumeric: 'tabular-nums' } }, remaining === null ? '—' : pctText(remaining)),
-        // 紧凑视图不会走到这里（etaView(compact) 恒为 null）；保留非截断样式，避免以后误开时变成残句。
-        eta
-          ? h('span', { key: 'e', title: eta.title, style: { flexShrink: 0, fontSize: 10, color: eta.color, whiteSpace: 'nowrap' } }, eta.text)
-          : null,
         // 倒计时用 ⏱ 区分刷新动作的 ↻，避免两个图标同义混淆。
         h('span', { key: 'r', style: { minWidth: 34, flexShrink: 0, textAlign: 'right', fontSize: 10, color: T.secondary, fontVariantNumeric: 'tabular-nums' } }, w?.resetAt ? `⏱ ${timeUntil(w.resetAt)}` : ''),
       ])
@@ -919,28 +600,12 @@ window.__ModuleLoader__.load({
       }
 
       const windows = Array.isArray(st.windows) ? st.windows : []
-      // 头部只给判断性摘要（最紧张窗口），具体数字留给下方窗口行，避免同一数字说两遍。
-      const tightest = tightestWindow(st)
 
       return h('div', null, [
         h('div', { key: 'sum', style: { display: 'flex', alignItems: 'center', gap: 6 } }, [
           h('span', { key: 'd', style: dotStyle(st.ok ? T.ok : T.err) }),
           // 窄视口下让标题让位给右侧摘要：摘要 flexShrink:0，标题可省略。
           h('span', { key: 't', style: { fontSize: 12, fontWeight: 600, color: T.label, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 1 } }, st.ok ? '已连接' : '异常'),
-          tightest
-            ? h(
-                'span',
-                {
-                  key: 'm',
-                  // host 只在面板标题行展示一次；这里不再重复。
-                  title: `最紧张窗口：${tightest.label ?? tightest.id ?? '—'}，剩余 ${pctText(tightest.remainingPct)}`,
-                  style: { marginLeft: 'auto', fontSize: 11, fontWeight: 600, color: remainingColor(tightest.remainingPct), fontVariantNumeric: 'tabular-nums', flexShrink: 0 },
-                },
-                // 用 label 而不是 shortLabel：shortLabel 是给 220px 悬浮微卡的窄列设计的紧凑缩写，
-                // 复用到这里会把「Weekly / Monthly」这类英文缩写漏进主面板。
-                `最紧张 ${tightest.label ?? tightest.id ?? '—'}`,
-              )
-            : null,
         ].filter(Boolean)),
         state.error
           ? h('div', { key: 'ce', style: { fontSize: 11, color: T.err, marginTop: 8 } }, `刷新失败：${state.error}`)
@@ -967,18 +632,12 @@ window.__ModuleLoader__.load({
       const remaining = w?.remainingPct ?? null
       const color = remainingColor(remaining)
       const band = remainingBand(remaining)
-      const eta = etaView(w)
       const statusText = w?.status && w.status !== 'ok' ? w.status : null
       const detail = remaining === null ? '数据不可用' : `已用 ${pctText(used)} · 剩余 ${pctText(remaining)}`
       return h('div', { style: { marginBottom: 12 } }, [
         h('div', { key: 'meta', style: { display: 'flex', alignItems: 'baseline', gap: 6, fontSize: 11, marginBottom: 4, fontVariantNumeric: 'tabular-nums' } }, [
           h('span', { key: 'l', style: { color: T.label, fontWeight: 500, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, w?.label ?? '—'),
           h('span', { key: 'r', title: detail, style: { marginLeft: 'auto', color, fontWeight: 600, flexShrink: 0 } }, remaining === null ? '剩余 —' : `剩余 ${pctText(remaining)}`),
-          // 估算整段展示、不截断：flexShrink:0 且无 ellipsis；空间不足时只让窗口标签 ellipsis，
-          // 档位徽标（告警不只靠颜色）、剩余 % 与倒计时都不收缩。
-          eta
-            ? h('span', { key: 'eta', title: eta.title, style: { flexShrink: 0, fontSize: 10, color: eta.color, whiteSpace: 'nowrap' } }, eta.text)
-            : null,
           // 低额度除颜色外再给文字标记：色觉障碍与灰度截图里也能看出档位。
           band
             ? h(
@@ -1052,7 +711,6 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ baseUrl, ...(apiKey ? { apiKey } : {}) }),
           })
           // 保存成功后回到用量视图；账号/baseUrl 变了就立刻作废旧账号的采样历史，不等下一次轮询。
-          noteEtaIdentity(result.config?.baseUrl ?? result.status?.config?.baseUrl, result.config?.apiKey?.hint)
           store.set({ status: result.status, config: result.config, view: 'status', error: null })
           setApiKey('')
         } catch (e) {
@@ -1072,7 +730,6 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ baseUrl, clearApiKey: true }),
           })
-          noteEtaIdentity(result.config?.baseUrl ?? result.status?.config?.baseUrl, result.config?.apiKey?.hint)
           store.set({ status: result.status, config: result.config, error: null })
         } catch (e) {
           setError(e?.message ?? '清除失败')
@@ -1345,6 +1002,10 @@ window.__ModuleLoader__.load({
 
     // ---------- 注册 ----------
     function apply(ctx) {
+      // 0.4.6 起不再使用采样持久化，清掉旧版本留下的键（仅清理，不含任何用户数据）。
+      try {
+        if (typeof localStorage !== 'undefined' && localStorage) localStorage.removeItem('dsh-opencode-status.eta-samples')
+      } catch {}
       // 轮询与 visibilitychange 监听随插件生命周期释放：不依赖 footer 是否挂载（侧栏收起/布局切换仍持续采样），
       // 但 dispose/HMR 时必须清掉，否则旧 ticker 会和新 ticker 并存、每 30 秒发两次请求。
       ctx.effect(() => ensureStatusPolling())
@@ -1370,7 +1031,7 @@ window.__ModuleLoader__.load({
     exports.apply = apply
     exports.inject = ['slots']
     // 仅供测试与诊断：估算/采样是纯函数 + 模块内状态，导出以便做真实单元测试（宿主侧不消费）。
-    exports.__internal = { estimateEta, recordSamples, getSamples, resetEtaSamples, fmtEtaDuration, coarsenEta, etaView, ensureStatusPolling, noteEtaIdentity }
+    exports.__internal = { ensureStatusPolling }
     return module.exports
   },
 })
