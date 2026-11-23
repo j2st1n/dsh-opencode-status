@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.9
+
+- 文档同步：`SECURITY.md` 新增来源围栏说明——各路由以 `kind: 'exact'` 注册会绕过宿主 `/api` 前缀准入，插件自补等价围栏（Host 白名单、拒绝 `Sec-Fetch-Site: cross-site`、Origin 同 authority），伪造来源返回 403；写请求另加 `application/json` 校验且在解析请求体之前拦截。同时说明围栏在宿主 `ctx.get('connection')` 返回 `null` 时回退到本地等价实现并仍拒绝不可信来源（有回归用例覆盖），并明确边界：只防浏览器来源与 DNS rebinding，不防同主机其他进程。
+
+无代码改动。
+
 ## 0.4.8
 
 - **修复折叠 rail 下悬停微卡被侧栏裁切**：侧栏折叠后 `.sidebarCol` 带 `overflow: hidden`，36px 宽的 rail 触发器会让绝对定位卡片被挤扁再裁掉。现在折叠态先量触发器位置，改用 `position: fixed` 把 236px 宽卡片放到图标上方并夹在视口内；折叠/展开切换时按当前几何重新量测，拿不到矩形时回落到兜底坐标。展开态仍为触发器上方绝对定位。卡片另加 `maxHeight: min(320px, 60vh)` + `overflowY: auto` 作兜底（卡片 `pointerEvents: 'none'`，滚轮到不了它，仅在极端矮视口下触发裁剪）。
