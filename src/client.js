@@ -343,10 +343,19 @@ window.__ModuleLoader__.load({
     }
 
     // ---------- 常驻入口（状态灯 + 月剩余摘要 + 220ms 悬浮微卡） ----------
+    /** 折叠 rail 下 fixed 卡片的目标宽度：放得下标题与三条窗口行，又不至于占满视口。 */
+    const HOVER_PREVIEW_WIDTH = 236
+
     function FooterEntry(props) {
       const state = useStore()
+      // 侧栏折叠成 rail 时宿主传 wide === false；此时侧栏列 .sidebarCol 有 overflow: hidden，
+      // 会把 absolute 卡片挤成 36px 再裁掉。
+      const isFolded = props?.wide === false
       const [hovering, setHovering] = useState(false)
+      // 折叠态 fixed 卡片坐标：进入悬停时按触发器量测，未量到（ref 未挂载）时为 null 走兜底坐标。
+      const [hoverPos, setHoverPos] = useState(null)
       const hoverTimerRef = useRef(null)
+      const triggerRef = useRef(null)
 
       useEffect(() => {
         // 只幂等确保 ticker 存在，不接管清理：ticker 的生命周期归 apply 的 ctx.effect 管理。
@@ -357,8 +366,33 @@ window.__ModuleLoader__.load({
       // 卸载时清掉待触发的悬停定时器，避免 220ms 后对已卸载组件 setState。
       useEffect(() => () => clearTimeout(hoverTimerRef.current), [])
 
+      /** 折叠 rail：量触发器位置，把 fixed 卡片放到图标上方的可读区域并夹在视口内。
+       *  ref 未挂载（拿不到 rect）时直接返回，卡片回落到兜底坐标，不抛错。 */
+      const measureHoverPos = () => {
+        const rect = triggerRef.current?.getBoundingClientRect?.()
+        if (!rect) return
+        const viewportWidth = window.innerWidth || 0
+        let left = Math.max(8, Math.round(rect.left))
+        if (viewportWidth > 0 && left + HOVER_PREVIEW_WIDTH > viewportWidth - 8) {
+          left = Math.max(8, viewportWidth - HOVER_PREVIEW_WIDTH - 8)
+        }
+        setHoverPos({
+          left,
+          bottom: Math.max(8, Math.round((window.innerHeight || 0) - rect.top + 6)),
+        })
+      }
+
+      // 折叠 / 展开切换会同时改变定位方式与可用宽度：悬停中切换模式时重算 fixed 坐标，
+      // 否则会沿用折叠态量到的旧坐标（或 null 兜底）。
+      useEffect(() => {
+        if (!hovering || !isFolded) return
+        measureHoverPos()
+      }, [isFolded, hovering])
+
       const onMouseEnter = () => {
         clearTimeout(hoverTimerRef.current)
+        // 折叠态先量位置：220ms 后卡片出现时坐标已就绪，不会先闪一帧兜底坐标。
+        if (isFolded) measureHoverPos()
         hoverTimerRef.current = setTimeout(() => setHovering(true), 220)
       }
       const onMouseLeave = () => {
@@ -403,13 +437,17 @@ window.__ModuleLoader__.load({
 
       // rail 模式：真正的 button（键盘可达、可点击），同样打开用量视图
       if (props?.wide === false) {
-        return h(
+        const railNode = h(
           'button',
           {
             className: 'oc-btn oc-footer-btn',
             type: 'button',
             title,
             'aria-label': '打开 OpenCode GO 用量面板',
+            // 悬停微卡要靠它量坐标：折叠 rail 只有 36px 宽，卡片必须脱离侧栏列定位。
+            ref: triggerRef,
+            onMouseEnter,
+            onMouseLeave,
             style: {
               width: 36,
               height: 36,
@@ -430,6 +468,20 @@ window.__ModuleLoader__.load({
             onClick: toggleOverlay,
           },
           monthlyRemaining !== null ? `${monthlyRemaining}%` : 'GO',
+        )
+
+        // 显示前置条件与宽态逐字一致：面板关闭、悬停 220ms、ready + ok 才出现悬浮微卡。
+        if (!hovering || state.open || st?.mode !== 'ready' || !st.ok) return railNode
+
+        return h(
+          'div',
+          {
+            style: { position: 'relative', width: '100%' },
+            onMouseEnter,
+            onMouseLeave,
+          },
+          railNode,
+          h(HoverCard, { status: st, folded: true, pos: hoverPos }),
         )
       }
 
@@ -500,6 +552,24 @@ window.__ModuleLoader__.load({
     function HoverCard(props) {
       const st = props.status
       const windows = Array.isArray(st?.windows) ? st.windows : []
+      // 宽侧栏：卡片贴在触发器上方，宽度随侧栏（absolute）。
+      // 折叠 rail：侧栏列 .sidebarCol 有 overflow: hidden，absolute 卡片会被 36px 的列宽挤扁再裁掉，
+      // 所以改 fixed + 量测坐标（见 measureHoverPos），ref 缺失时落在视口左下的兜底坐标。
+      const pos = props.pos
+      const box = props.folded
+        ? {
+            position: 'fixed',
+            left: pos ? pos.left : 8,
+            bottom: pos ? pos.bottom : 8,
+            width: HOVER_PREVIEW_WIDTH,
+            maxWidth: 'calc(100vw - 16px)',
+          }
+        : {
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            bottom: 'calc(100% + 6px)',
+          }
       return h(
         'div',
         {
@@ -507,10 +577,7 @@ window.__ModuleLoader__.load({
           // 只读微卡是面板的视觉重复，对读屏隐藏，避免同一份数据播报两遍。
           'aria-hidden': true,
           style: {
-            position: 'absolute',
-            left: 0,
-            right: 0,
-            bottom: 'calc(100% + 6px)',
+            ...box,
             pointerEvents: 'none',
             background: T.bg,
             border: `1px solid ${T.border2}`,
@@ -519,6 +586,11 @@ window.__ModuleLoader__.load({
             padding: '10px 12px 8px',
             fontSize: 11,
             color: T.label,
+            // 窗口数量或文案增长时卡片向上撑高；限高后内部滚动，避免顶出视口。
+            // 注意：卡片是纯预览、pointerEvents:'none'，滚轮事件到不了它，故 maxHeight 是
+            // 兜底而非可交互滚动。当前内容上界固定（3 个窗口约 205px），仅在极端矮视口下才会触发裁剪。
+            maxHeight: 'min(320px, 60vh)',
+            overflowY: 'auto',
             zIndex: 100,
             fontFamily: 'system-ui, -apple-system, sans-serif',
           },
@@ -540,7 +612,9 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { key: 'rows', style: { display: 'flex', flexDirection: 'column', gap: 6 } },
-            windows.map((w, i) => h(MiniQuotaRow, { key: w.id ?? i, window: w })),
+            windows.length > 0
+              ? windows.map((w, i) => h(MiniQuotaRow, { key: w.id ?? i, window: w }))
+              : h('div', { key: 'empty', style: { fontSize: 10, color: T.secondary } }, '暂无窗口数据'),
           ),
           h(
             'div',
@@ -903,7 +977,7 @@ window.__ModuleLoader__.load({
 
       // 焦点管理：面板挂载（phase 进入 open）后把焦点移入面板（容器 tabIndex=-1），关闭时归还打开前的触发元素（footer 按钮）。
       // 依赖必须带上 phase：面板 DOM 要等 phase effect 把 phase 推到 'open' 才挂载，只依赖 state.open 时
-      // 首次执行 panelRef.current 还是 null，panel.focus() 会静默失效（运行时复现由 /tmp/verify-focus.mjs 手工验证，CI 无 jsdom 依赖）。
+      // 首次执行 panelRef.current 还是 null，panel.focus() 会静默失效（运行时复现为一次性临时脚本手工验证，未入库；CI 无 jsdom 依赖）。
       useEffect(() => {
         if (!state.open || phase !== 'open') return
         if (typeof document === 'undefined') return

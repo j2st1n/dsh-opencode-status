@@ -398,8 +398,10 @@ export function apply(ctx, config = {}) {
 
   /** 优先使用宿主的官方 fence，缺失 connection 服务时回退到等价的本地实现。 */
   function isTrustedRequest(req) {
+    // 真实宿主 ctx.get('connection') 返回 null（不是 undefined）；用 != null 同时覆盖两者，
+    // 否则会读 null.isTrusted 抛 TypeError，被 guard 包成 500 并回传内部错误文本。
     const connection = connectionService()
-    if (connection !== undefined && typeof connection.isTrusted === 'function') {
+    if (connection != null && typeof connection.isTrusted === 'function') {
       return readService(() => connection.isTrusted(req)) === true
     }
     return trustedByLocalFence(req)

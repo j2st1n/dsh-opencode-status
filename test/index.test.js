@@ -116,7 +116,9 @@ function harness({
     },
     effect: (factory) => factory(),
   }
-  const readConnection = () => connection ?? undefined
+  // 真实宿主 ctx.get('connection') 返回 null；harness 必须保持 null 而不是归一化为 undefined，
+  // 否则 `connection !== undefined` 这类空值判定失误永远测不出来。
+  const readConnection = () => connection ?? null
   if (settingsMount === 'get') {
     ctx.get = (name) => {
       if (name === 'settings') return settingsService ?? undefined
@@ -565,6 +567,34 @@ test('GET 路由同样做 Host/来源 fence，阻断 DNS rebinding 的读取路�
   assert.equal(loopback.body.apiKey.configured, false)
 })
 
+test('无 connection 服务（真实宿主返回 null）时伪造 Host 必须 403 而非 500，且不泄漏内部异常', async () => {
+  // 回归用例：src/index.js 曾用 `connection !== undefined`，在真实宿主 ctx.get('connection')
+  // 返回 null 时读取 null.isTrusted 抛 TypeError，被 guard 包成 500 并把
+  // "Cannot read properties of null (reading 'isTrusted')" 原样回传客户端。
+  // 此处不传 connection，harness 的 readConnection() 会返回真实的 null。
+  const app = harness({ config: { baseUrl: DEFAULT_BASE_URL } })
+
+  for (const path of ['/api/opencode-status', '/api/opencode-status/config']) {
+    const route = app.routes.get(path)
+    const forged = await invoke(route, 'GET', path, undefined, {
+      headers: { host: 'evil.example.test:3080', 'sec-fetch-site': 'cross-site' },
+    })
+
+    assert.equal(forged.status, 403, `${path} 在无 connection 服务时应回退本地围栏并拒绝`)
+    assert.equal(forged.body.error?.code, 'FORBIDDEN')
+    assert.ok(
+      !JSON.stringify(forged.body).includes('isTrusted'),
+      `${path} 的错误响应不得泄漏内部 TypeError 文本`,
+    )
+
+    // 对照：同一路径的可信来源仍应放行，证明失败方向是「回退到本地围栏」而非「一律拒绝」。
+    const trusted = await invoke(route, 'GET', path, undefined, {
+      headers: { host: '127.0.0.1:3080' },
+    })
+    assert.equal(trusted.status, 200, `${path} 在可信 loopback 下仍应正常返回`)
+  }
+})
+
 test('宿主提供 connection.isTrusted 时读与写都委托官方判定', async () => {
   const app = harness({ connection: { isTrusted: (req) => req.headers?.host === 'harness.internal:3080' } })
   const configRoute = app.routes.get('/api/opencode-status/config')
@@ -741,7 +771,7 @@ test('面板可 Esc 关闭、具备 dialog 语义与焦点归还，进度条暴�
   assert.match(panel, /'aria-label': settingsView \? 'OpenCode GO 连接配置' : 'OpenCode GO 用量'/)
   assert.doesNotMatch(panel, /'aria-modal'/)
   // 打开时焦点移入面板（容器 tabIndex=-1），关闭时归还触发元素。
-  // 运行时复现由 /tmp/verify-focus.mjs 手工验证（真实 React 18.3.1 + jsdom），CI 无 jsdom 依赖，这里只固化关键结构：
+  // 运行时复现为一次性临时脚本手工验证（真实 React 18.3.1 + jsdom，脚本未入库），CI 无 jsdom 依赖，这里只固化关键结构：
   // deps 必须同时包含 state.open 与 phase，且 phase 未到 'open' 时早退——否则面板 DOM 尚未挂载时
   // panelRef.current 为 null，panel.focus() 静默失效。
   assert.match(panel, /\}, \[state\.open, phase\]\)/)
@@ -1080,11 +1110,13 @@ test('侧栏按钮按月剩余着色，rail 模式渲染真正的 button 并打�
   // 文案体现月剩余摘要，颜色取剩余额度阈值
   assert.match(text, /月剩余 \$\{monthlyRemaining\}%/)
   assert.match(text, /color = monthlyRemaining === null \? T\.warn : remainingColor\(monthlyRemaining\)/)
-  // rail 模式（wide === false）是真 button，不是 div
+  // rail 模式（wide === false）的真 button，点击打开用量视图
   const rail = text.slice(text.indexOf('if (props?.wide === false)'), text.indexOf('const segments ='))
   assert.match(rail, /h\(\s*'button'/)
   assert.match(rail, /onClick: toggleOverlay/)
-  assert.doesNotMatch(rail, /h\(\s*'div'/)
+  // 悬停微卡的定位壳是 div（与宽态同一套 wrapper），但触发器本身必须是真 button：
+  // 不允许退化成「带 onClick 的 div」，也不允许把点击处理挂到定位壳上。
+  assert.doesNotMatch(rail, /h\(\s*'div'[\s\S]{0,400}?onClick:/)
   assert.match(rail, /monthlyRemaining !== null \? `\$\{monthlyRemaining\}%` : 'GO'/)
 })
 
@@ -1160,6 +1192,141 @@ test('220ms 悬浮卡展示标题 + 上次同步与三窗口紧凑行，且不�
   // 保留 30 秒 GET 自动刷新；打开面板走缓存，不额外探测上游
   assert.match(text, /setInterval\(\(\) => refreshStatus\(\), 30_000\)/)
   assert.match(text, /GET 命中 30 秒缓存，不触发额外上游探测/)
+})
+
+const HOVER_READY_STATE = {
+  open: false,
+  error: null,
+  status: {
+    mode: 'ready',
+    ok: true,
+    fetchedAt: 2_000,
+    windows: [
+      { id: 'rolling', label: '滚动窗口', shortLabel: '5h', usedPct: 40, remainingPct: 60, status: 'ok', resetAt: null },
+      { id: 'weekly', label: '周窗口', shortLabel: '周', usedPct: 20, remainingPct: 80, status: 'ok', resetAt: null },
+      { id: 'monthly', label: '月窗口', shortLabel: '月', usedPct: 10, remainingPct: 90, status: 'ok', resetAt: null },
+    ],
+  },
+}
+
+test('折叠 rail 悬停微卡改 fixed 并按触发器量测：宽度可读、夹在视口内（P0）', () => {
+  // 侧栏底部 rail：800 高视口里 36px 图标位于 left 8 / top 764
+  const rail = { left: 8, top: 764 }
+  const rt = createFooterHoverRuntime({ state: HOVER_READY_STATE, viewport: { width: 1280, height: 800 }, rect: rail })
+  rt.enter({ wide: false })
+
+  const card = rt.card()
+  assert.ok(card, '折叠态悬停后必须出现悬浮微卡')
+  const style = card.props.style
+  // 关键：fixed 脱离 .sidebarCol（overflow: hidden）的裁切，absolute 会被 36px 列宽挤扁
+  assert.equal(style.position, 'fixed')
+  // 用 getBoundingClientRect() 量出来的触发器坐标：左对齐图标，底部贴图标上方 6px
+  assert.equal(style.left, rail.left)
+  assert.equal(style.bottom, 800 - rail.top + 6)
+  // 36px rail 放不下三行数据：fixed 卡片给足可读宽度，同时不超出视口
+  assert.equal(style.width, 236)
+  assert.equal(style.maxWidth, 'calc(100vw - 16px)')
+  // 只读卡片仍然不接收指针事件，不遮挡 footer 按钮
+  assert.equal(style.pointerEvents, 'none')
+  assert.equal(card.props['aria-hidden'], true)
+  const text = collectNodeText(card).join('|')
+  assert.match(text, /OpenCode GO 用量/)
+  assert.match(text, /点击查看详情/)
+
+  // 触发器贴近视口右缘：卡片整体夹回视口内，不横向溢出
+  const clamped = createFooterHoverRuntime({ state: HOVER_READY_STATE, viewport: { width: 1280, height: 800 }, rect: { left: 1200, top: 764 } })
+  clamped.enter({ wide: false })
+  assert.equal(clamped.card().props.style.left, 1280 - 236 - 8)
+  assert.ok(clamped.card().props.style.left + 236 <= 1280 - 8)
+
+  // 触发器贴左缘：left 至少留 8px，不会贴边裁掉圆角与阴影
+  const edge = createFooterHoverRuntime({ state: HOVER_READY_STATE, viewport: { width: 1280, height: 800 }, rect: { left: 2, top: 764 } })
+  edge.enter({ wide: false })
+  assert.equal(edge.card().props.style.left, 8)
+})
+
+test('宽侧栏悬停微卡保持 absolute 贴触发器上方，折叠/展开切换时重算 fixed 坐标', () => {
+  const rt = createFooterHoverRuntime({
+    state: HOVER_READY_STATE,
+    viewport: { width: 1280, height: 800 },
+    rect: { left: 8, top: 764 },
+  })
+
+  // 宽侧栏：视觉与既有实现一致——absolute、左右拉满侧栏宽度、贴在触发器上方 6px
+  rt.enter({ wide: true })
+  const wideCard = rt.card()
+  assert.ok(wideCard, '宽态悬停后必须出现悬浮微卡')
+  assert.equal(wideCard.props.style.position, 'absolute')
+  assert.equal(wideCard.props.style.left, 0)
+  assert.equal(wideCard.props.style.right, 0)
+  assert.equal(wideCard.props.style.bottom, 'calc(100% + 6px)')
+  assert.equal(wideCard.props.style.width, undefined)
+  assert.equal(wideCard.props.style.maxWidth, undefined)
+
+  // 悬停中折叠（宽态从不量测坐标）：切到 fixed 并按新鲜触发器位置重算
+  rt.setRect({ left: 8, top: 764 })
+  rt.render({ wide: false })
+  const foldedCard = rt.card()
+  assert.equal(foldedCard.props.style.position, 'fixed')
+  assert.equal(foldedCard.props.style.left, 8)
+  assert.equal(foldedCard.props.style.bottom, 800 - 764 + 6)
+
+  // 折叠中展开：回到 absolute，不残留 fixed 坐标
+  rt.setRect({ left: 8, top: 700 })
+  rt.render({ wide: true })
+  const expandedCard = rt.card()
+  assert.equal(expandedCard.props.style.position, 'absolute')
+  assert.equal(expandedCard.props.style.left, 0)
+  assert.equal(expandedCard.props.style.right, 0)
+  assert.equal(expandedCard.props.style.bottom, 'calc(100% + 6px)')
+
+  // 移出立即收起
+  rt.leave()
+  assert.equal(rt.card(), null)
+})
+
+test('折叠态悬停语义不变：220ms 延时、open/mode/ok 前置条件不放宽、ref 缺失兜底不抛错', () => {
+  const viewport = { width: 1280, height: 800 }
+  const rect = { left: 8, top: 764 }
+  const rt = createFooterHoverRuntime({ state: HOVER_READY_STATE, viewport, rect })
+
+  // 未满 220ms：只有 rail 按钮，不出现卡片；定时器延时仍是 220ms
+  rt.enter({ wide: false }, { flush: false })
+  assert.equal(rt.card(), null)
+  assert.deepEqual(rt.pendingDelays(), [220])
+  rt.flush()
+  assert.ok(rt.card())
+  // 移出立即收起，不需要等定时器
+  rt.leave()
+  assert.equal(rt.card(), null)
+
+  // 面板打开时不显示（rail 按钮仍在）
+  const openRt = createFooterHoverRuntime({ state: { ...HOVER_READY_STATE, open: true }, viewport, rect })
+  openRt.enter({ wide: false })
+  assert.equal(openRt.card(), null)
+  assert.equal(openRt.trigger().type, 'button')
+
+  // 前置条件不放宽：悬停、面板关闭之外，仍然要求 mode === 'ready' 且 ok
+  const blockedStates = [
+    { ...HOVER_READY_STATE, status: { ...HOVER_READY_STATE.status, mode: 'needs_config', ok: false } },
+    { ...HOVER_READY_STATE, status: { ...HOVER_READY_STATE.status, ok: false, error: { message: 'gateway down' } } },
+    { ...HOVER_READY_STATE, status: null },
+  ]
+  for (const state of blockedStates) {
+    const blocked = createFooterHoverRuntime({ state, viewport, rect })
+    blocked.enter({ wide: false })
+    assert.equal(blocked.card(), null, `前置条件不满足时不得显示卡片：${JSON.stringify(state.status)}`)
+    assert.equal(blocked.trigger().type, 'button')
+  }
+
+  // ref 未挂载（拿不到 rect）：卡片仍出现、落在视口左下兜底坐标，且不抛错
+  const noRef = createFooterHoverRuntime({ state: HOVER_READY_STATE, viewport, rect, attachRef: false })
+  assert.doesNotThrow(() => noRef.enter({ wide: false }))
+  const fallback = noRef.card()
+  assert.ok(fallback, '量不到 rect 时卡片仍要出现（兜底坐标），不能静默消失')
+  assert.equal(fallback.props.style.position, 'fixed')
+  assert.equal(fallback.props.style.left, 8)
+  assert.equal(fallback.props.style.bottom, 8)
 })
 
 test('手动刷新推进请求序号，更早的在途 GET 响应不再覆盖状态（F2）', () => {
@@ -1616,6 +1783,194 @@ function renderClientTree({ state, forceHover = false }) {
     },
   })
   return { plugin, footer: registered[0], panel: registered[1] }
+}
+
+/**
+ * 迷你 React 运行时：只服务 footer 悬停定位用例（fixed 量测 / 视口夹取 / 折叠展开重算）。
+ *
+ * 真的执行组件函数体，支持 useState / useRef / useEffect / useSyncExternalStore；渲染后把 ref
+ * 挂到假 DOM 节点上（模拟 React 挂载），可触发事件处理器、拨动 220ms 定时器，并按依赖变化
+ * flush effect —— 于是断言看到的是组件算出来的定位，而不是源码字符串。
+ */
+function createFooterHoverRuntime({ state, viewport = { width: 1280, height: 800 }, rect = null, attachRef = true }) {
+  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  const hooks = []
+  const timers = new Map()
+  let timerSeq = 0
+  let cursor = 0
+  let dirty = false
+  let tree = null
+  let lastProps = null
+  let plugin = null
+  let triggerRect = rect
+
+  const React = {
+    createElement: (type, props, ...children) => ({
+      type,
+      props: props ?? {},
+      children: children.flat(Infinity).filter((child) => child != null),
+    }),
+    useState(initial) {
+      const index = cursor++
+      if (!hooks[index]) hooks[index] = { kind: 'state', value: initial }
+      const slot = hooks[index]
+      return [
+        slot.value,
+        (next) => {
+          slot.value = typeof next === 'function' ? next(slot.value) : next
+          dirty = true
+        },
+      ]
+    },
+    useRef(initial) {
+      const index = cursor++
+      if (!hooks[index]) hooks[index] = { kind: 'ref', current: initial }
+      return hooks[index]
+    },
+    useEffect(effect, deps) {
+      const index = cursor++
+      const prev = hooks[index]
+      const changed = !prev || !deps || deps.length !== prev.deps.length || deps.some((dep, k) => dep !== prev.deps[k])
+      hooks[index] = { kind: 'effect', fn: effect, deps, pending: Boolean(prev?.pending) || changed }
+    },
+    useSyncExternalStore: () => state,
+  }
+
+  const sandbox = {
+    window: {
+      __ModuleLoader__: {
+        load: (definition) => {
+          plugin = definition.factory((name) => {
+            if (name === 'react') return React
+            throw new Error(`unexpected require: ${name}`)
+          })
+        },
+      },
+      innerWidth: viewport.width,
+      innerHeight: viewport.height,
+    },
+    document: { createElement: () => ({ remove() {} }), head: { appendChild() {} } },
+    fetch: async () => ({ ok: true, json: async () => ({}) }),
+    setInterval: () => 0,
+    clearInterval: () => {},
+    setTimeout: (fn, delay) => {
+      timerSeq += 1
+      timers.set(timerSeq, { fn, delay })
+      return timerSeq
+    },
+    clearTimeout: (id) => timers.delete(id),
+  }
+  vm.createContext(sandbox)
+  vm.runInContext(source, sandbox, { filename: 'client.js' })
+  const registered = []
+  plugin.apply({
+    effect: (factory) => factory(),
+    slots: {
+      inject: (name, factory) => factory(),
+      register: (meta, component) => {
+        registered.push(component)
+        return () => {}
+      },
+    },
+  })
+  const footer = registered[0]
+
+  // 注册的是 `(props) => h(FooterEntry, props)` 薄壳：渲染时必须整棵树一次性展开成宿主节点，
+  // 且每次展开前把 hook 游标归零。若在 find/attachRefs 里再展开函数组件，会把 FooterEntry
+  // 执行第二遍、拿到一组全新的 ref，量测就永远读不到挂载后的 DOM 位置。
+  const expand = (node) => {
+    if (node == null || node === false) return node
+    if (Array.isArray(node)) return node.map(expand)
+    if (typeof node === 'string' || typeof node === 'number') return node
+    if (typeof node.type === 'function') return expand(node.type(node.props))
+    return { ...node, children: node.children.map(expand) }
+  }
+
+  const attachRefs = (node) => {
+    if (node == null || node === false) return
+    if (Array.isArray(node)) {
+      node.forEach(attachRefs)
+      return
+    }
+    if (typeof node === 'string' || typeof node === 'number') return
+    if (attachRef && node.props.ref && typeof node.props.ref === 'object' && 'current' in node.props.ref) {
+      node.props.ref.current = { getBoundingClientRect: () => triggerRect }
+    }
+    node.children.forEach(attachRefs)
+  }
+
+  const find = (node, predicate) => {
+    if (node == null || node === false) return null
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = find(child, predicate)
+        if (hit) return hit
+      }
+      return null
+    }
+    if (typeof node === 'string' || typeof node === 'number') return null
+    if (predicate(node)) return node
+    for (const child of node.children) {
+      const hit = find(child, predicate)
+      if (hit) return hit
+    }
+    return null
+  }
+
+  const trigger = () => find(tree, (node) => node.type === 'button' && typeof node.props.onMouseEnter === 'function')
+  const wrapper = () => find(tree, (node) => node.type === 'div' && typeof node.props.onMouseEnter === 'function')
+  const card = () => find(tree, (node) => String(node.props.className ?? '').includes('oc-hover-card'))
+
+  /** 渲染并 flush：函数体 → 挂 ref → 跑依赖变化的 effect，直到没有新的状态写入。 */
+  const render = (props) => {
+    lastProps = props
+    for (let pass = 0; pass < 8; pass += 1) {
+      cursor = 0
+      dirty = false
+      tree = expand({ type: footer, props: props ?? {}, children: [] })
+      attachRefs(tree)
+      for (const slot of hooks) {
+        if (slot?.kind !== 'effect' || !slot.pending) continue
+        slot.pending = false
+        slot.fn()
+      }
+      if (!dirty) break
+    }
+    return tree
+  }
+
+  const flush = () => {
+    for (const [id, timer] of [...timers]) {
+      timers.delete(id)
+      timer.fn()
+    }
+    return render(lastProps)
+  }
+
+  return {
+    render,
+    flush,
+    card,
+    trigger,
+    wrapper,
+    /** 排队中的定时器延时，用来断言悬停仍是 220ms。 */
+    pendingDelays: () => [...timers.values()].map((timer) => timer.delay),
+    setRect(next) {
+      triggerRect = next
+    },
+    /** 悬停入场：flush=false 时只挂 220ms 定时器，用于断言「未满 220ms 不出现」。 */
+    enter(props, { flush: flushNow = true } = {}) {
+      render(props)
+      trigger().props.onMouseEnter()
+      if (flushNow) flush()
+      return this
+    },
+    /** 移出：优先走定位壳（与真实 DOM 事件一致），没有壳时直接走触发器。 */
+    leave() {
+      ;(wrapper() ?? trigger()).props.onMouseLeave()
+      return render(lastProps)
+    },
+  }
 }
 
 const collectNodeText = (node, out = []) => {
